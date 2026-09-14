@@ -96,10 +96,10 @@ main.rs    CLI, config precedence, rendering
 * The library never writes to the terminal. Text and reasoning arrive through
   the callback given to `Agent::run`; progress output is opt-in via `Output`
   (`Quiet` / `Progress` / `Verbose`), and the CLI picks it.
-* Progress uses one line and no scrolling: `......` while a turn is in flight,
-  then the model's reasoning rewritten in place (dimmed, clipped to one line
-  wide), then the answer. Nothing else reaches stderr, so
-  `mini-agent "..." > answer.md` captures exactly the answer.
+* Progress uses one line and no scrolling: the model's reasoning rewritten in
+  place (dimmed, clipped to one line wide), then the answer taking that line
+  over. Nothing else reaches stderr, so `mini-agent "..." > answer.md` captures
+  exactly the answer.
 * `--verbose` also prints each tool call with up to three lines of its output.
   Note that some gateways stream only the reasoning and deliver the answer text
   in one burst at the end — the reasoning line is the live part there.

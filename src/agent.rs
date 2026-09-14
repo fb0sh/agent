@@ -37,8 +37,7 @@ pub struct Agent {
 pub enum Output {
     /// Nothing at all: render the deltas yourself.
     Quiet,
-    /// One line: dots while a turn is in flight, then the model's reasoning
-    /// overwriting itself in place, dimmed.
+    /// One line: the model's reasoning, overwriting itself in place, dimmed.
     Progress,
     /// The above, plus every tool call and its output.
     Verbose,
@@ -68,9 +67,9 @@ impl Agent {
     ) -> Result<String> {
         self.messages.push(Message::User(task.to_string()));
 
-        // One line of progress is all this prints: dots while nothing has
-        // arrived, then the model's reasoning overwriting itself, then the
-        // answer. Tracking where the cursor is keeps the three from colliding.
+        // One line of progress is all this prints: the model's reasoning
+        // overwriting itself, then the answer taking the line over. Tracking
+        // where the cursor is keeps the two from colliding.
         let mut line = Line::Clean;
         let reporting = self.output != Output::Quiet;
         let verbose = self.output == Output::Verbose;
@@ -78,9 +77,6 @@ impl Agent {
 
         for _ in 0..self.max_iterations {
             thinking.clear();
-            if reporting {
-                draw(&mut line, DOTS);
-            }
             let response = self
                 .llm
                 .chat(&self.messages, &self.definitions, &mut |delta, chunk| {
@@ -156,8 +152,6 @@ impl Agent {
 /// How much tool output a verbose trace shows, so the screen never scrolls away.
 const TRACE_LINES: usize = 3;
 
-/// What the agent shows while it has nothing to say yet.
-const DOTS: &str = "......";
 /// Reasoning is squeezed into one line this many columns wide, never more.
 const THINKING_WIDTH: usize = 60;
 
