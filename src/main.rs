@@ -56,6 +56,10 @@ struct Args {
         value_name = "N"
     )]
     max_iterations: usize,
+
+    /// Show each tool call, the tool output and the model's reasoning.
+    #[arg(short, long, env = "MINI_AGENT_VERBOSE")]
+    verbose: bool,
 }
 
 #[tokio::main]
@@ -97,9 +101,11 @@ async fn run() -> Result<()> {
 
     let llm = Llm::new(args.api, args.model, args.base_url, api_key)?;
     let tools = Tools::new(cwd);
-    let mut agent = Agent::new(llm, tools, args.max_iterations);
+    let mut agent = Agent::new(llm, tools, args.max_iterations, args.verbose);
 
-    // The answer streams straight to stdout; reasoning stays on stderr, dimmed.
+    // The answer streams straight to stdout. Reasoning is only worth showing on a
+    // terminal, and only when the user asked for detail.
+    let show_thinking = args.verbose;
     let mut streamed = false;
     let mut ended_with_newline = true;
     let mut thinking_open = false;
@@ -118,7 +124,7 @@ async fn run() -> Result<()> {
                     let _ = out.write_all(chunk.as_bytes());
                     let _ = out.flush();
                 }
-                Delta::Thinking if io::stderr().is_terminal() => {
+                Delta::Thinking if show_thinking && io::stderr().is_terminal() => {
                     let mut err = io::stderr().lock();
                     let _ = write!(err, "\x1b[2m{chunk}\x1b[0m");
                     let _ = err.flush();

@@ -53,6 +53,7 @@ Any task can be given as several words (`mini-agent fix the build`).
 | `--api-key <KEY>` | `MINI_AGENT_API_KEY` | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` |
 | `-C, --cwd <DIR>` | `MINI_AGENT_CWD` | current directory |
 | `--max-iterations <N>` | `MINI_AGENT_MAX_ITERATIONS` | `32` |
+| `-v, --verbose` | `MINI_AGENT_VERBOSE` | off |
 
 Priority: CLI flag → environment variable → default.
 
@@ -88,6 +89,9 @@ main.rs    CLI parsing, config precedence, wiring
 * Responses are streamed: answer text goes to `stdout` as it is generated,
   reasoning (reasoning models only) to `stderr`, dimmed, and only on a terminal.
   Piping the output therefore yields just the answer.
+* The default output is quiet — one `→ read` style line per step plus the
+  answer. `--verbose` adds the full arguments, up to three lines of tool output
+  and the model's reasoning, so a long run never scrolls the screen away.
 * There is no provider registry, no tool trait, no service layer: `Api` is an
   enum, `chat` is a `match`, tools are `match` arms in `Tools::execute`.
 * Tool calls run one at a time on purpose — `write`/`edit`/`exec` depend on each

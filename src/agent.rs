@@ -28,10 +28,12 @@ pub struct Agent {
     definitions: Vec<ToolDefinition>,
     messages: Vec<Message>,
     max_iterations: usize,
+    /// Show full tool calls, their output and the model's reasoning.
+    verbose: bool,
 }
 
 impl Agent {
-    pub fn new(llm: Llm, tools: Tools, max_iterations: usize) -> Self {
+    pub fn new(llm: Llm, tools: Tools, max_iterations: usize, verbose: bool) -> Self {
         let definitions = tools.definitions();
         Self {
             llm,
@@ -39,6 +41,7 @@ impl Agent {
             definitions,
             messages: vec![Message::System(SYSTEM_PROMPT.to_string())],
             max_iterations,
+            verbose,
         }
     }
 
@@ -56,8 +59,8 @@ impl Agent {
         // Set while a streamed chunk has left a line half-written, so our own
         // trace output starts on a fresh line instead of gluing onto it.
         let mut line_open = false;
-        // Reasoning is only displayed on a terminal, so only then does it own a line.
-        let show_thinking = on_terminal();
+        // Reasoning is only displayed on a terminal, and only when asked for.
+        let show_thinking = self.verbose && on_terminal();
 
         for _ in 0..self.max_iterations {
             // A model turn can take a while; say so instead of showing a blank screen.
@@ -89,14 +92,24 @@ impl Agent {
             let mut results = Vec::with_capacity(tool_calls.len());
             for call in &tool_calls {
                 break_line(&mut line_open);
-                eprintln!(
-                    "→ {}({})",
-                    call.name,
-                    clip(&call.arguments.to_string(), 160)
-                );
+                if self.verbose {
+                    eprintln!(
+                        "→ {}({})",
+                        call.name,
+                        clip(&call.arguments.to_string(), 160)
+                    );
+                } else {
+                    // One short line per step: enough to see progress, no wall of JSON.
+                    eprintln!("→ {}", call.name);
+                }
                 let result = self.tools.execute(call).await;
-                break_line(&mut line_open);
-                eprintln!("  {}", first_line(&result.output));
+                if self.verbose {
+                    break_line(&mut line_open);
+                    // At most a few lines of output, so the screen never scrolls away.
+                    for line in result.output.lines().take(TRACE_LINES) {
+                        eprintln!("  {}", clip(line, 160));
+                    }
+                }
                 results.push(result);
             }
 
@@ -114,9 +127,8 @@ impl Agent {
     }
 }
 
-fn first_line(text: &str) -> &str {
-    text.lines().next().unwrap_or("(no output)")
-}
+/// How much tool output a verbose trace shows, so the screen never scrolls away.
+const TRACE_LINES: usize = 3;
 
 /// True when progress output is worth showing, i.e. stderr is a terminal.
 fn on_terminal() -> bool {
@@ -240,7 +252,7 @@ mod tests {
             "test".into(),
         )
         .unwrap();
-        Agent::new(llm, Tools::new(cwd), steps)
+        Agent::new(llm, Tools::new(cwd), steps, false)
     }
 
     /// A callback that keeps whatever the agent streams, for assertions.
