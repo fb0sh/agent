@@ -67,49 +67,59 @@ impl Agent {
     ) -> Result<String> {
         self.messages.push(Message::User(task.to_string()));
 
-        // Set while a streamed chunk has left a line half-written, so our own
-        // trace output starts on a fresh line instead of gluing onto it.
-        let mut line_open = false;
-        // Set while the one-line progress indicator is on screen.
-        let mut status_shown = false;
+        // One line of progress is all this prints: dots while nothing has
+        // arrived, then the model's reasoning overwriting itself, then the
+        // answer. Tracking where the cursor is keeps the three from colliding.
+        let mut line = Line::Clean;
         let reporting = self.output != Output::Quiet;
-        // Reasoning is only displayed on a terminal, and only when asked for.
-        let show_thinking = self.output == Output::Verbose && on_terminal();
+        let verbose = self.output == Output::Verbose;
+        let mut thinking = String::new();
 
         for _ in 0..self.max_iterations {
-            // One short line while the agent works: enough to see that something
-            // is happening, nothing that scrolls the screen away.
+            thinking.clear();
             if reporting {
-                break_line(&mut line_open);
-                show_status(&mut status_shown, "thinking…");
+                draw(&mut line, DOTS);
             }
             let response = self
                 .llm
                 .chat(&self.messages, &self.definitions, &mut |delta, chunk| {
-                    hide_status(&mut status_shown);
-                    line_open = reporting
-                        && !chunk.ends_with('\n')
-                        && (delta == Delta::Text || show_thinking);
+                    match delta {
+                        // Reasoning replaces the previous line in place, so a
+                        // long chain of thought never scrolls the screen.
+                        Delta::Thinking if verbose => {
+                            thinking.push_str(chunk);
+                            draw(&mut line, &format!("\x1b[2m{}\x1b[0m", tail(&thinking)));
+                        }
+                        Delta::Text => {
+                            // The answer needs the line: drop the indicator, once,
+                            // before the first chunk. Later chunks are just text.
+                            if line == Line::Ours {
+                                release(&mut line);
+                            }
+                            line = if chunk.ends_with('\n') {
+                                Line::Clean
+                            } else {
+                                Line::Answer
+                            };
+                        }
+                        _ => {}
+                    }
                     on_delta(delta, chunk);
                 })
                 .await;
-            let Response { text, tool_calls } = response.inspect_err(|_| {
-                hide_status(&mut status_shown);
-                break_line(&mut line_open);
-            })?;
+            let Response { text, tool_calls } = response.inspect_err(|_| release(&mut line))?;
 
             // No tool calls means the model is done talking.
             if tool_calls.is_empty() {
-                hide_status(&mut status_shown);
+                release(&mut line);
                 return Ok(text.unwrap_or_default());
             }
 
             // Tools run one at a time on purpose: write/edit/exec depend on each other.
-            // The indicator stays up while they run, so a slow command still shows life.
             let mut results = Vec::with_capacity(tool_calls.len());
             for call in &tool_calls {
-                if self.output == Output::Verbose {
-                    break_line(&mut line_open);
+                if verbose {
+                    release(&mut line);
                     eprintln!(
                         "→ {}({})",
                         call.name,
@@ -117,11 +127,10 @@ impl Agent {
                     );
                 }
                 let result = self.tools.execute(call).await;
-                if self.output == Output::Verbose {
-                    break_line(&mut line_open);
+                if verbose {
                     // At most a few lines of output, so the screen never scrolls away.
-                    for line in result.output.lines().take(TRACE_LINES) {
-                        eprintln!("  {}", clip(line, 160));
+                    for text in result.output.lines().take(TRACE_LINES) {
+                        eprintln!("  {}", clip(text, 160));
                     }
                 }
                 results.push(result);
@@ -144,36 +153,69 @@ impl Agent {
 /// How much tool output a verbose trace shows, so the screen never scrolls away.
 const TRACE_LINES: usize = 3;
 
+/// What the agent shows while it has nothing to say yet.
+const DOTS: &str = "......";
+/// Reasoning is squeezed into one line this many columns wide, never more.
+const THINKING_WIDTH: usize = 60;
+
 /// True when progress output is worth showing, i.e. stderr is a terminal.
 fn on_terminal() -> bool {
     io::stderr().is_terminal()
 }
 
-/// End a line that a streamed chunk left open, so later output is not glued to it.
-fn break_line(line_open: &mut bool) {
-    if *line_open {
-        eprintln!();
-        *line_open = false;
-    }
+/// What the last line of the terminal currently holds.
+#[derive(Clone, Copy, PartialEq)]
+enum Line {
+    /// Nothing half-written.
+    Clean,
+    /// Streamed answer text, which is the user's output and must not be erased.
+    Answer,
+    /// A line we drew ourselves (dots, or reasoning): ours to overwrite.
+    Ours,
 }
 
-/// The one-line progress indicator, drawn only on a terminal so pipes stay clean.
-fn show_status(shown: &mut bool, text: &str) {
+/// Draw over our own line, or start a fresh one.
+fn draw(line: &mut Line, text: &str) {
+    release(line);
     if on_terminal() {
-        eprint!("\r\x1b[2K{text}");
+        eprint!("{text}");
         let _ = io::stderr().flush();
+        *line = Line::Ours;
     }
-    *shown = true;
 }
 
-/// Take the indicator down. Does nothing once it is already gone, so it is safe
-/// to call for every streamed chunk.
-fn hide_status(shown: &mut bool) {
-    if *shown && on_terminal() {
-        eprint!("\r\x1b[2K");
-        let _ = io::stderr().flush();
+/// Get back to a clean line: erase our own progress, or step past answer text.
+fn release(line: &mut Line) {
+    match *line {
+        Line::Ours if on_terminal() => {
+            eprint!("\r\x1b[2K");
+            let _ = io::stderr().flush();
+        }
+        Line::Answer => eprintln!(),
+        _ => {}
     }
-    *shown = false;
+    *line = Line::Clean;
+}
+
+/// The tail of `text` that fits in one line, with newlines flattened so it can
+/// never wrap: reasoning scrolls in place instead of scrolling the screen.
+fn tail(text: &str) -> String {
+    let mut width = 0;
+    let mut taken = Vec::new();
+    for character in text.chars().rev() {
+        let character = if character.is_whitespace() {
+            ' '
+        } else {
+            character
+        };
+        let columns = if character.is_ascii() { 1 } else { 2 };
+        if width + columns > THINKING_WIDTH {
+            break;
+        }
+        width += columns;
+        taken.push(character);
+    }
+    taken.iter().rev().collect()
 }
 
 #[cfg(test)]

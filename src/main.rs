@@ -1,6 +1,6 @@
 //! `mini-agent "fix the build"` — a thin CLI over the `agent` library.
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use agent::{Agent, Delta, Llm, Output, Tools, llm};
@@ -101,40 +101,21 @@ async fn run() -> Result<()> {
     };
     let mut agent = Agent::new(llm, tools, args.max_iterations, output);
 
-    // The answer streams straight to stdout. Reasoning is only worth showing on a
-    // terminal, and only when the user asked for detail.
-    let show_thinking = args.verbose;
+    // The answer streams straight to stdout; the agent draws its own one-line
+    // progress and reasoning on stderr.
     let mut streamed = false;
     let mut ended_with_newline = true;
-    let mut thinking_open = false;
     let answer = agent
         .run(&task, &mut |delta, chunk| {
-            match delta {
-                Delta::Text => {
-                    // Reasoning came first: end its dim line before the answer.
-                    if thinking_open {
-                        eprintln!();
-                        thinking_open = false;
-                    }
-                    streamed = true;
-                    ended_with_newline = chunk.ends_with('\n');
-                    let mut out = io::stdout().lock();
-                    let _ = out.write_all(chunk.as_bytes());
-                    let _ = out.flush();
-                }
-                Delta::Thinking if show_thinking && io::stderr().is_terminal() => {
-                    let mut err = io::stderr().lock();
-                    let _ = write!(err, "\x1b[2m{chunk}\x1b[0m");
-                    let _ = err.flush();
-                    thinking_open = !chunk.ends_with('\n');
-                }
-                Delta::Thinking => {}
+            if let Delta::Text = delta {
+                streamed = true;
+                ended_with_newline = chunk.ends_with('\n');
+                let mut out = io::stdout().lock();
+                let _ = out.write_all(chunk.as_bytes());
+                let _ = out.flush();
             }
         })
         .await?;
-    if thinking_open {
-        eprintln!();
-    }
 
     if streamed {
         if !ended_with_newline {
