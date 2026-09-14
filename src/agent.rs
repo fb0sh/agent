@@ -59,48 +59,46 @@ impl Agent {
         // Set while a streamed chunk has left a line half-written, so our own
         // trace output starts on a fresh line instead of gluing onto it.
         let mut line_open = false;
+        // Set while the one-line progress indicator is on screen.
+        let mut status_shown = false;
         // Reasoning is only displayed on a terminal, and only when asked for.
         let show_thinking = self.verbose && on_terminal();
 
         for _ in 0..self.max_iterations {
-            // A model turn can take a while; say so instead of showing a blank screen.
+            // One short line while the agent works: enough to see that something
+            // is happening, nothing that scrolls the screen away.
             break_line(&mut line_open);
-            status(&format!("waiting for {} …", self.llm.model));
-            let mut started = false;
+            show_status(&mut status_shown, "thinking…");
             let response = self
                 .llm
                 .chat(&self.messages, &self.definitions, &mut |delta, chunk| {
-                    if !started {
-                        started = true;
-                        clear_status();
-                    }
+                    hide_status(&mut status_shown);
                     line_open = !chunk.ends_with('\n') && (delta == Delta::Text || show_thinking);
                     on_delta(delta, chunk);
                 })
                 .await;
-            if !started {
-                clear_status();
-            }
-            let Response { text, tool_calls } = response?;
+            let Response { text, tool_calls } = response.inspect_err(|_| {
+                hide_status(&mut status_shown);
+                break_line(&mut line_open);
+            })?;
 
             // No tool calls means the model is done talking.
             if tool_calls.is_empty() {
+                hide_status(&mut status_shown);
                 return Ok(text.unwrap_or_default());
             }
 
             // Tools run one at a time on purpose: write/edit/exec depend on each other.
+            // The indicator stays up while they run, so a slow command still shows life.
             let mut results = Vec::with_capacity(tool_calls.len());
             for call in &tool_calls {
-                break_line(&mut line_open);
                 if self.verbose {
+                    break_line(&mut line_open);
                     eprintln!(
                         "→ {}({})",
                         call.name,
                         clip(&call.arguments.to_string(), 160)
                     );
-                } else {
-                    // One short line per step: enough to see progress, no wall of JSON.
-                    eprintln!("→ {}", call.name);
                 }
                 let result = self.tools.execute(call).await;
                 if self.verbose {
@@ -143,19 +141,23 @@ fn break_line(line_open: &mut bool) {
     }
 }
 
-/// A transient line on stderr, so pipes stay clean.
-fn status(text: &str) {
+/// The one-line progress indicator, drawn only on a terminal so pipes stay clean.
+fn show_status(shown: &mut bool, text: &str) {
     if on_terminal() {
         eprint!("\r\x1b[2K{text}");
         let _ = io::stderr().flush();
     }
+    *shown = true;
 }
 
-fn clear_status() {
-    if on_terminal() {
+/// Take the indicator down. Does nothing once it is already gone, so it is safe
+/// to call for every streamed chunk.
+fn hide_status(shown: &mut bool) {
+    if *shown && on_terminal() {
         eprint!("\r\x1b[2K");
         let _ = io::stderr().flush();
     }
+    *shown = false;
 }
 
 #[cfg(test)]

@@ -89,9 +89,11 @@ main.rs    CLI parsing, config precedence, wiring
 * Responses are streamed: answer text goes to `stdout` as it is generated,
   reasoning (reasoning models only) to `stderr`, dimmed, and only on a terminal.
   Piping the output therefore yields just the answer.
-* The default output is quiet — one `→ read` style line per step plus the
-  answer. `--verbose` adds the full arguments, up to three lines of tool output
-  and the model's reasoning, so a long run never scrolls the screen away.
+* The default output is quiet: a single `thinking…` line while the agent works,
+  then the answer. Nothing else reaches stderr, so
+  `mini-agent "..." > answer.md` captures exactly the answer.
+* `--verbose` adds every tool call, up to three lines of tool output and the
+  model's reasoning, so a long run never scrolls the screen away.
 * There is no provider registry, no tool trait, no service layer: `Api` is an
   enum, `chat` is a `match`, tools are `match` arms in `Tools::execute`.
 * Tool calls run one at a time on purpose — `write`/`edit`/`exec` depend on each
