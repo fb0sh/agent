@@ -85,6 +85,9 @@ main.rs    CLI parsing, config precedence, wiring
 
 * `llm.rs` is the only place that knows a protocol's JSON. Everything above it
   speaks `Message` / `Response`.
+* Responses are streamed: answer text goes to `stdout` as it is generated,
+  reasoning (reasoning models only) to `stderr`, dimmed, and only on a terminal.
+  Piping the output therefore yields just the answer.
 * There is no provider registry, no tool trait, no service layer: `Api` is an
   enum, `chat` is a `match`, tools are `match` arms in `Tools::execute`.
 * Tool calls run one at a time on purpose — `write`/`edit`/`exec` depend on each
@@ -101,6 +104,8 @@ cargo test
 
 Covers `read` (window, missing file, bad offset), `write` (create, overwrite),
 `edit` (0/1/many matches), `exec` (success, non-zero exit, timeout),
-`Tools`/`clip`/`resolve`, and the agent loop against a throwaway
-OpenAI-compatible HTTP server: text answer, one tool call, several rounds,
+`Tools`/`clip`/`resolve`, per-protocol stream parsing (text, reasoning, and tool
+arguments split across events), and the agent loop against a throwaway
+OpenAI-compatible SSE server: text answer, streaming deltas, reasoning kept out
+of the answer, reassembly of split tool arguments, one tool call, several rounds,
 tool errors fed back, and hitting `--max-iterations`.

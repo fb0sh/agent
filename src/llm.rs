@@ -1,8 +1,9 @@
 //! The only place that knows about API protocols.
 //!
-//! Everything above this module speaks [`Message`] / [`Response`]. The JSON
-//! shaping for each protocol lives in one `*_body` + `parse_*` pair below.
-//! There is no provider registry: a protocol is a variant, a call is a `match`.
+//! Everything above this module speaks [`Message`] / [`Response`]. Each protocol
+//! is one `*_body` builder plus one streaming accumulator, and a call is a
+//! `match`. There is no provider registry and no whole-body parsing path: every
+//! protocol we support can stream, so that is the only path there is.
 
 use std::fmt;
 use std::str::FromStr;
@@ -111,6 +112,15 @@ pub struct Response {
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// A piece of model output that arrives while a turn is still being generated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delta {
+    /// Answer text.
+    Text,
+    /// Internal reasoning of a reasoning model: worth showing, not part of the answer.
+    Thinking,
+}
+
 pub struct Llm {
     pub api: Api,
     pub model: String,
@@ -143,11 +153,37 @@ impl Llm {
         })
     }
 
-    pub async fn chat(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<Response> {
+    /// Send one turn and stream it, calling `on_delta` as output arrives.
+    pub async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        on_delta: &mut dyn FnMut(Delta, &str),
+    ) -> Result<Response> {
+        let body = match self.api {
+            Api::OpenAi => openai_body(&self.model, messages, tools),
+            Api::Anthropic => anthropic_body(&self.model, messages, tools),
+            Api::Gemini => gemini_body(messages, tools),
+        };
+        let mut response = self.send(&body).await?;
+
+        if !is_event_stream(&response) {
+            bail!(
+                "{} did not stream a response (content-type: {}): \
+                 this endpoint may not support streaming",
+                self.api,
+                response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("none"),
+            );
+        }
+
         let response = match self.api {
-            Api::OpenAi => self.openai(messages, tools).await?,
-            Api::Anthropic => self.anthropic(messages, tools).await?,
-            Api::Gemini => self.gemini(messages, tools).await?,
+            Api::OpenAi => stream_openai(&mut response, on_delta).await?,
+            Api::Anthropic => stream_anthropic(&mut response, on_delta).await?,
+            Api::Gemini => stream_gemini(&mut response, on_delta).await?,
         };
         if response.text.is_none() && response.tool_calls.is_empty() {
             bail!("{} returned neither text nor tool calls", self.api);
@@ -161,13 +197,16 @@ impl Llm {
             Api::OpenAi => format!("{base}/chat/completions"),
             Api::Anthropic if base.ends_with("/v1") => format!("{base}/messages"),
             Api::Anthropic => format!("{base}/v1/messages"),
-            Api::Gemini => format!("{base}/v1beta/models/{}:generateContent", self.model),
+            Api::Gemini => format!(
+                "{base}/v1beta/models/{}:streamGenerateContent?alt=sse",
+                self.model
+            ),
         }
     }
 
     /// One POST per turn, with the auth scheme of the protocol, and API errors
     /// surfaced with their response body instead of a bare status code.
-    async fn post(&self, body: &Value) -> Result<Value> {
+    async fn send(&self, body: &Value) -> Result<reqwest::Response> {
         let url = self.url();
         let request = match self.api {
             Api::OpenAi => self.client.post(&url).bearer_auth(&self.api_key),
@@ -187,45 +226,83 @@ impl Llm {
             .await
             .with_context(|| format!("request to {url} failed"))?;
         let status = response.status();
-        let text = response
-            .text()
-            .await
-            .context("failed to read the response body")?;
         if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
             bail!(
                 "{} error {status}: {}",
                 self.api,
                 clip(&text, ERROR_BODY_LIMIT)
             );
         }
-        serde_json::from_str(&text)
-            .with_context(|| format!("{} returned invalid JSON: {}", self.api, clip(&text, 500)))
+        Ok(response)
     }
+}
 
-    // ---------------------------------------------------------------- openai
+fn is_event_stream(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("event-stream"))
+}
 
-    async fn openai(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<Response> {
-        let body = self
-            .post(&openai_body(&self.model, messages, tools))
-            .await?;
-        parse_openai(body)
+/// Read an SSE body, handing every `data:` payload to `on_event`.
+async fn read_sse(
+    response: &mut reqwest::Response,
+    mut on_event: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let mut buffer = String::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read the stream")?
+    {
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(end) = buffer.find('\n') {
+            let line = buffer[..end].trim_end_matches('\r').to_string();
+            buffer.drain(..=end);
+            if let Some(payload) = line.strip_prefix("data:") {
+                let payload = payload.trim();
+                if !payload.is_empty() && payload != "[DONE]" {
+                    on_event(payload)?;
+                }
+            }
+        }
     }
+    Ok(())
+}
 
-    // ------------------------------------------------------------- anthropic
+/// A tool call under construction: OpenAI and Anthropic stream its arguments in
+/// fragments, so they are concatenated until the stream ends.
+#[derive(Default)]
+struct CallBuilder {
+    id: String,
+    name: String,
+    arguments: String,
+}
 
-    async fn anthropic(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<Response> {
-        let body = self
-            .post(&anthropic_body(&self.model, messages, tools))
-            .await?;
-        parse_anthropic(body)
+impl CallBuilder {
+    /// `None` for a gap: Anthropic numbers every content block, so a stream can
+    /// leave an empty slot where a text or thinking block was.
+    fn finish(self) -> Option<ToolCall> {
+        (!self.name.is_empty()).then(|| ToolCall {
+            id: self.id,
+            name: self.name,
+            arguments: if self.arguments.trim().is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str(&self.arguments).unwrap_or_else(|_| json!({}))
+            },
+        })
     }
+}
 
-    // ---------------------------------------------------------------- gemini
-
-    async fn gemini(&self, messages: &[Message], tools: &[ToolDefinition]) -> Result<Response> {
-        let body = self.post(&gemini_body(messages, tools)).await?;
-        parse_gemini(body)
+/// The builder for one stream index, created on first sight.
+fn slot(calls: &mut Vec<CallBuilder>, index: usize) -> &mut CallBuilder {
+    while calls.len() <= index {
+        calls.push(CallBuilder::default());
     }
+    &mut calls[index]
 }
 
 // --------------------------------------------------------------------- openai
@@ -277,7 +354,7 @@ fn openai_body(model: &str, messages: &[Message], tools: &[ToolDefinition]) -> V
         }
     }
 
-    let mut body = json!({"model": model, "messages": msgs});
+    let mut body = json!({"model": model, "messages": msgs, "stream": true});
     if !tools.is_empty() {
         body["tools"] = Value::Array(
             tools
@@ -299,69 +376,100 @@ fn openai_body(model: &str, messages: &[Message], tools: &[ToolDefinition]) -> V
 }
 
 #[derive(Deserialize)]
-struct OpenAiReply {
+struct OpenAiChunk {
+    #[serde(default)]
     choices: Vec<OpenAiChoice>,
 }
 
 #[derive(Deserialize)]
 struct OpenAiChoice {
-    message: OpenAiMessage,
+    delta: OpenAiDelta,
 }
 
 #[derive(Deserialize)]
-struct OpenAiMessage {
+struct OpenAiDelta {
+    #[serde(default)]
     content: Option<String>,
+    /// Reasoning models stream their thinking next to the answer.
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
     tool_calls: Option<Vec<OpenAiCall>>,
 }
 
 #[derive(Deserialize)]
 struct OpenAiCall {
     #[serde(default)]
-    id: String,
-    function: OpenAiFunction,
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<OpenAiFunction>,
 }
 
 #[derive(Deserialize)]
 struct OpenAiFunction {
-    name: String,
-    /// Usually a JSON string, but some gateways send an object.
-    arguments: Option<Value>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
-fn parse_openai(body: Value) -> Result<Response> {
-    let reply: OpenAiReply =
-        serde_json::from_value(body).context("unexpected openai response shape")?;
-    let Some(choice) = reply.choices.into_iter().next() else {
-        return Ok(Response::default());
-    };
-    let tool_calls = choice
-        .message
-        .tool_calls
-        .unwrap_or_default()
-        .into_iter()
-        .map(|call| {
-            let arguments = parse_arguments(call.function.arguments.as_ref());
-            ToolCall {
-                id: call.id,
-                name: call.function.name,
-                arguments,
+#[derive(Default)]
+struct OpenAiStream {
+    text: String,
+    calls: Vec<CallBuilder>,
+}
+
+impl OpenAiStream {
+    fn apply(&mut self, payload: &str, on_delta: &mut dyn FnMut(Delta, &str)) -> Result<()> {
+        let chunk: OpenAiChunk =
+            serde_json::from_str(payload).context("unexpected openai stream event")?;
+        for choice in chunk.choices {
+            if let Some(text) = choice.delta.content.filter(|text| !text.is_empty()) {
+                self.text.push_str(&text);
+                on_delta(Delta::Text, &text);
             }
-        })
-        .collect();
-    Ok(Response {
-        text: choice.message.content.filter(|text| !text.is_empty()),
-        tool_calls,
-    })
+            if let Some(thinking) = choice.delta.reasoning.filter(|text| !text.is_empty()) {
+                on_delta(Delta::Thinking, &thinking);
+            }
+            for call in choice.delta.tool_calls.unwrap_or_default() {
+                let builder = slot(&mut self.calls, call.index);
+                if let Some(id) = call.id {
+                    builder.id = id;
+                }
+                if let Some(function) = call.function {
+                    if let Some(name) = function.name {
+                        builder.name = name;
+                    }
+                    if let Some(arguments) = function.arguments {
+                        builder.arguments.push_str(&arguments);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Response {
+        Response {
+            text: (!self.text.is_empty()).then_some(self.text),
+            tool_calls: self
+                .calls
+                .into_iter()
+                .filter_map(CallBuilder::finish)
+                .collect(),
+        }
+    }
 }
 
-fn parse_arguments(arguments: Option<&Value>) -> Value {
-    match arguments {
-        Some(Value::String(text)) if !text.trim().is_empty() => {
-            serde_json::from_str(text).unwrap_or_else(|_| json!({}))
-        }
-        Some(Value::Object(_)) => arguments.cloned().unwrap_or_else(|| json!({})),
-        _ => json!({}),
-    }
+async fn stream_openai(
+    response: &mut reqwest::Response,
+    on_delta: &mut dyn FnMut(Delta, &str),
+) -> Result<Response> {
+    let mut stream = OpenAiStream::default();
+    read_sse(response, |payload| stream.apply(payload, on_delta)).await?;
+    Ok(stream.finish())
 }
 
 // ------------------------------------------------------------------ anthropic
@@ -415,6 +523,7 @@ fn anthropic_body(model: &str, messages: &[Message], tools: &[ToolDefinition]) -
         "model": model,
         "max_tokens": ANTHROPIC_MAX_TOKENS,
         "messages": contents,
+        "stream": true,
     });
     if !system.is_empty() {
         body["system"] = json!(system);
@@ -437,46 +546,107 @@ fn anthropic_body(model: &str, messages: &[Message], tools: &[ToolDefinition]) -
 }
 
 #[derive(Deserialize)]
-struct AnthropicReply {
-    content: Vec<AnthropicBlock>,
-}
-
-#[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum AnthropicBlock {
-    Text {
-        text: String,
+enum AnthropicEvent {
+    ContentBlockStart {
+        index: usize,
+        content_block: AnthropicStart,
     },
-    ToolUse {
-        id: String,
-        name: String,
-        #[serde(default)]
-        input: Value,
+    ContentBlockDelta {
+        index: usize,
+        delta: AnthropicDelta,
     },
     #[serde(other)]
     Other,
 }
 
-fn parse_anthropic(body: Value) -> Result<Response> {
-    let reply: AnthropicReply =
-        serde_json::from_value(body).context("unexpected anthropic response shape")?;
-    let mut text = String::new();
-    let mut tool_calls = Vec::new();
-    for block in reply.content {
-        match block {
-            AnthropicBlock::Text { text: chunk } => text.push_str(&chunk),
-            AnthropicBlock::ToolUse { id, name, input } => tool_calls.push(ToolCall {
-                id,
-                name,
-                arguments: input,
-            }),
-            AnthropicBlock::Other => {}
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicStart {
+    ToolUse {
+        id: String,
+        name: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicDelta {
+    TextDelta {
+        text: String,
+    },
+    InputJsonDelta {
+        partial_json: String,
+    },
+    ThinkingDelta {
+        thinking: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Default)]
+struct AnthropicStream {
+    text: String,
+    calls: Vec<CallBuilder>,
+}
+
+impl AnthropicStream {
+    fn apply(&mut self, payload: &str, on_delta: &mut dyn FnMut(Delta, &str)) -> Result<()> {
+        let event: AnthropicEvent =
+            serde_json::from_str(payload).context("unexpected anthropic stream event")?;
+        match event {
+            AnthropicEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
+                if let AnthropicStart::ToolUse { id, name } = content_block {
+                    let builder = slot(&mut self.calls, index);
+                    builder.id = id;
+                    builder.name = name;
+                }
+            }
+            AnthropicEvent::ContentBlockDelta { index, delta } => match delta {
+                AnthropicDelta::TextDelta { text } => {
+                    self.text.push_str(&text);
+                    on_delta(Delta::Text, &text);
+                }
+                AnthropicDelta::ThinkingDelta { thinking } => {
+                    on_delta(Delta::Thinking, &thinking);
+                }
+                AnthropicDelta::InputJsonDelta { partial_json } => {
+                    slot(&mut self.calls, index)
+                        .arguments
+                        .push_str(&partial_json);
+                }
+                AnthropicDelta::Other => {}
+            },
+            AnthropicEvent::Other => {}
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Response {
+        Response {
+            text: (!self.text.is_empty()).then_some(self.text),
+            tool_calls: self
+                .calls
+                .into_iter()
+                .filter_map(CallBuilder::finish)
+                .collect(),
         }
     }
-    Ok(Response {
-        text: (!text.is_empty()).then_some(text),
-        tool_calls,
-    })
+}
+
+async fn stream_anthropic(
+    response: &mut reqwest::Response,
+    on_delta: &mut dyn FnMut(Delta, &str),
+) -> Result<Response> {
+    let mut stream = AnthropicStream::default();
+    read_sse(response, |payload| stream.apply(payload, on_delta)).await?;
+    Ok(stream.finish())
 }
 
 // --------------------------------------------------------------------- gemini
@@ -564,6 +734,9 @@ struct GeminiContent {
 struct GeminiPart {
     #[serde(default)]
     text: Option<String>,
+    /// Set on the reasoning parts of a thinking model.
+    #[serde(default)]
+    thought: Option<bool>,
     #[serde(rename = "functionCall", default)]
     function_call: Option<GeminiCall>,
 }
@@ -575,30 +748,199 @@ struct GeminiCall {
     args: Option<Value>,
 }
 
-fn parse_gemini(body: Value) -> Result<Response> {
-    let reply: GeminiReply =
-        serde_json::from_value(body).context("unexpected gemini response shape")?;
-    let mut text = String::new();
-    let mut tool_calls = Vec::new();
-    for part in reply
-        .candidates
-        .into_iter()
-        .flat_map(|candidate| candidate.content)
-        .flat_map(|content| content.parts)
-    {
-        if let Some(chunk) = part.text {
-            text.push_str(&chunk);
+#[derive(Default)]
+struct GeminiStream {
+    text: String,
+    calls: Vec<ToolCall>,
+}
+
+impl GeminiStream {
+    fn apply(&mut self, payload: &str, on_delta: &mut dyn FnMut(Delta, &str)) -> Result<()> {
+        let reply: GeminiReply =
+            serde_json::from_str(payload).context("unexpected gemini stream event")?;
+        for part in reply
+            .candidates
+            .into_iter()
+            .flat_map(|candidate| candidate.content)
+            .flat_map(|content| content.parts)
+        {
+            if let Some(text) = part.text {
+                if part.thought.unwrap_or(false) {
+                    on_delta(Delta::Thinking, &text);
+                } else {
+                    self.text.push_str(&text);
+                    on_delta(Delta::Text, &text);
+                }
+            }
+            // Gemini sends each call whole, with no id of its own.
+            if let Some(call) = part.function_call {
+                self.calls.push(ToolCall {
+                    id: format!("call_{}", self.calls.len()),
+                    name: call.name,
+                    arguments: call.args.unwrap_or_else(|| json!({})),
+                });
+            }
         }
-        if let Some(call) = part.function_call {
-            tool_calls.push(ToolCall {
-                id: format!("call_{}", tool_calls.len()),
-                name: call.name,
-                arguments: call.args.unwrap_or_else(|| json!({})),
-            });
+        Ok(())
+    }
+
+    fn finish(self) -> Response {
+        Response {
+            text: (!self.text.is_empty()).then_some(self.text),
+            tool_calls: self.calls,
         }
     }
-    Ok(Response {
-        text: (!text.is_empty()).then_some(text),
-        tool_calls,
-    })
+}
+
+async fn stream_gemini(
+    response: &mut reqwest::Response,
+    on_delta: &mut dyn FnMut(Delta, &str),
+) -> Result<Response> {
+    let mut stream = GeminiStream::default();
+    read_sse(response, |payload| stream.apply(payload, on_delta)).await?;
+    Ok(stream.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records the deltas a stream emits, in order.
+    #[derive(Default)]
+    struct Sink(Vec<(Delta, String)>);
+
+    impl Sink {
+        fn callback(&mut self) -> impl FnMut(Delta, &str) + '_ {
+            |delta, chunk| self.0.push((delta, chunk.to_string()))
+        }
+
+        fn text(&self) -> String {
+            self.0
+                .iter()
+                .filter(|(delta, _)| *delta == Delta::Text)
+                .map(|(_, chunk)| chunk.as_str())
+                .collect()
+        }
+
+        fn thinking(&self) -> usize {
+            self.0
+                .iter()
+                .filter(|(delta, _)| *delta == Delta::Thinking)
+                .count()
+        }
+    }
+
+    #[test]
+    fn openai_streams_text_and_reasoning() {
+        let mut stream = OpenAiStream::default();
+        let mut sink = Sink::default();
+        let mut callback = sink.callback();
+        for payload in [
+            r#"{"choices":[{"delta":{"role":"assistant"}}]}"#,
+            r#"{"choices":[{"delta":{"reasoning":"hmm"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"Hel"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"lo"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ] {
+            stream.apply(payload, &mut callback).unwrap();
+        }
+        drop(callback);
+        let response = stream.finish();
+
+        assert_eq!(response.text.as_deref(), Some("Hello"));
+        assert_eq!(sink.text(), "Hello");
+        assert_eq!(sink.thinking(), 1);
+        assert!(response.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn openai_assembles_fragmented_tool_calls() {
+        let mut stream = OpenAiStream::default();
+        let mut sink = Sink::default();
+        let mut callback = sink.callback();
+        for payload in [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{\"pa"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"a.rs\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_2","function":{"name":"exec","arguments":"{\"command\":\"ls\"}"}}]}}]}"#,
+        ] {
+            stream.apply(payload, &mut callback).unwrap();
+        }
+        drop(callback);
+        let response = stream.finish();
+
+        assert!(response.text.is_none());
+        assert_eq!(response.tool_calls.len(), 2);
+        assert_eq!(response.tool_calls[0].id, "call_1");
+        assert_eq!(response.tool_calls[0].name, "read");
+        assert_eq!(response.tool_calls[0].arguments, json!({"path": "a.rs"}));
+        assert_eq!(response.tool_calls[1].name, "exec");
+        assert_eq!(response.tool_calls[1].arguments, json!({"command": "ls"}));
+    }
+
+    #[test]
+    fn openai_keeps_unparseable_arguments_empty() {
+        let mut stream = OpenAiStream::default();
+        let mut sink = Sink::default();
+        let mut callback = sink.callback();
+        stream
+            .apply(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"read","arguments":"not json"}}]}}]}"#,
+                &mut callback,
+            )
+            .unwrap();
+
+        assert_eq!(stream.finish().tool_calls[0].arguments, json!({}));
+    }
+
+    #[test]
+    fn anthropic_streams_text_tool_input_and_thinking() {
+        let mut stream = AnthropicStream::default();
+        let mut sink = Sink::default();
+        let mut callback = sink.callback();
+        for payload in [
+            r#"{"type":"message_start","message":{"id":"m"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"let me see"}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Look"}}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"edit"}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\"a.rs\"}"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ] {
+            stream.apply(payload, &mut callback).unwrap();
+        }
+        drop(callback);
+        let response = stream.finish();
+
+        assert_eq!(response.text.as_deref(), Some("Look"));
+        assert_eq!(sink.text(), "Look");
+        assert_eq!(sink.thinking(), 1);
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "toolu_1");
+        assert_eq!(response.tool_calls[0].name, "edit");
+        assert_eq!(response.tool_calls[0].arguments, json!({"path": "a.rs"}));
+    }
+
+    #[test]
+    fn gemini_streams_text_and_calls() {
+        let mut stream = GeminiStream::default();
+        let mut sink = Sink::default();
+        let mut callback = sink.callback();
+        for payload in [
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"thinking","thought":true}]}}]}"#,
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"Hi"}]}}]}"#,
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"text":" there"}]}}]}"#,
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read","args":{"path":"a.rs"}}}]}}]}"#,
+        ] {
+            stream.apply(payload, &mut callback).unwrap();
+        }
+        drop(callback);
+        let response = stream.finish();
+
+        assert_eq!(response.text.as_deref(), Some("Hi there"));
+        assert_eq!(sink.text(), "Hi there");
+        assert_eq!(sink.thinking(), 1);
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "read");
+        assert_eq!(response.tool_calls[0].arguments, json!({"path": "a.rs"}));
+    }
 }

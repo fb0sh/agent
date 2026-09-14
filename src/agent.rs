@@ -4,7 +4,7 @@ use std::io::{self, IsTerminal, Write};
 
 use anyhow::{Result, bail};
 
-use crate::llm::{Llm, Message, Response};
+use crate::llm::{Delta, Llm, Message, Response};
 use crate::tools::{ToolDefinition, Tools, clip};
 
 const SYSTEM_PROMPT: &str = "\
@@ -43,33 +43,59 @@ impl Agent {
     }
 
     /// Run one task to completion and return the model's final text.
-    pub async fn run(&mut self, task: &str) -> Result<String> {
+    ///
+    /// Answer text and reasoning are passed to `on_delta` as they arrive, so the
+    /// caller decides where they go; the return value is the same final text.
+    pub async fn run(
+        &mut self,
+        task: &str,
+        on_delta: &mut dyn FnMut(Delta, &str),
+    ) -> Result<String> {
         self.messages.push(Message::User(task.to_string()));
+
+        // Set while a streamed chunk has left a line half-written, so our own
+        // trace output starts on a fresh line instead of gluing onto it.
+        let mut line_open = false;
+        // Reasoning is only displayed on a terminal, so only then does it own a line.
+        let show_thinking = on_terminal();
 
         for _ in 0..self.max_iterations {
             // A model turn can take a while; say so instead of showing a blank screen.
+            break_line(&mut line_open);
             status(&format!("waiting for {} …", self.llm.model));
-            let response = self.llm.chat(&self.messages, &self.definitions).await;
-            clear_status();
+            let mut started = false;
+            let response = self
+                .llm
+                .chat(&self.messages, &self.definitions, &mut |delta, chunk| {
+                    if !started {
+                        started = true;
+                        clear_status();
+                    }
+                    line_open = !chunk.ends_with('\n') && (delta == Delta::Text || show_thinking);
+                    on_delta(delta, chunk);
+                })
+                .await;
+            if !started {
+                clear_status();
+            }
             let Response { text, tool_calls } = response?;
 
             // No tool calls means the model is done talking.
             if tool_calls.is_empty() {
                 return Ok(text.unwrap_or_default());
             }
-            if let Some(thought) = text.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-                eprintln!("{thought}");
-            }
 
             // Tools run one at a time on purpose: write/edit/exec depend on each other.
             let mut results = Vec::with_capacity(tool_calls.len());
             for call in &tool_calls {
+                break_line(&mut line_open);
                 eprintln!(
                     "→ {}({})",
                     call.name,
                     clip(&call.arguments.to_string(), 160)
                 );
                 let result = self.tools.execute(call).await;
+                break_line(&mut line_open);
                 eprintln!("  {}", first_line(&result.output));
                 results.push(result);
             }
@@ -92,16 +118,29 @@ fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("(no output)")
 }
 
-/// A transient line on stderr, shown only on a terminal so pipes stay clean.
+/// True when progress output is worth showing, i.e. stderr is a terminal.
+fn on_terminal() -> bool {
+    io::stderr().is_terminal()
+}
+
+/// End a line that a streamed chunk left open, so later output is not glued to it.
+fn break_line(line_open: &mut bool) {
+    if *line_open {
+        eprintln!();
+        *line_open = false;
+    }
+}
+
+/// A transient line on stderr, so pipes stay clean.
 fn status(text: &str) {
-    if io::stderr().is_terminal() {
+    if on_terminal() {
         eprint!("\r\x1b[2K{text}");
         let _ = io::stderr().flush();
     }
 }
 
 fn clear_status() {
-    if io::stderr().is_terminal() {
+    if on_terminal() {
         eprint!("\r\x1b[2K");
         let _ = io::stderr().flush();
     }
@@ -119,25 +158,23 @@ mod tests {
 
     use crate::llm::Api;
 
+    /// Wrap OpenAI stream events as an SSE body.
+    fn sse(events: &[String]) -> String {
+        events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect()
+    }
+
     fn text_reply(text: &str) -> String {
-        json!({"choices": [{"message": {"role": "assistant", "content": text}}]}).to_string()
+        sse(&[json!({"choices": [{"delta": {"content": text}}]}).to_string()])
     }
 
     fn tool_reply(id: &str, name: &str, arguments: &Value) -> String {
-        json!({
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": arguments.to_string()},
-                    }]
-                }
-            }]
-        })
-        .to_string()
+        sse(&[json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": id, "function": {"name": name, "arguments": arguments.to_string()}}
+        ]}}]})
+        .to_string()])
     }
 
     /// A throwaway OpenAI-compatible server that answers with `replies` in order.
@@ -151,7 +188,7 @@ mod tests {
                 };
                 read_request(&mut socket).await;
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
                     reply.len()
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
@@ -206,12 +243,101 @@ mod tests {
         Agent::new(llm, Tools::new(cwd), steps)
     }
 
+    /// A callback that keeps whatever the agent streams, for assertions.
+    #[derive(Default)]
+    struct Seen(Vec<(Delta, String)>);
+
+    impl Seen {
+        fn callback(&mut self) -> impl FnMut(Delta, &str) + '_ {
+            |delta, chunk| self.0.push((delta, chunk.to_string()))
+        }
+    }
+
     #[tokio::test]
     async fn returns_a_text_response() {
         let dir = crate::tools::temp_dir("agent-text");
         let mut agent = agent(vec![text_reply("all done")], 4, dir).await;
 
-        assert_eq!(agent.run("say hi").await.unwrap(), "all done");
+        assert_eq!(
+            agent.run("say hi", &mut |_, _| {}).await.unwrap(),
+            "all done"
+        );
+    }
+
+    #[tokio::test]
+    async fn streams_text_as_it_arrives() {
+        let dir = crate::tools::temp_dir("agent-stream");
+        let replies = sse(&[
+            json!({"choices": [{"delta": {"content": "all "}}]}).to_string(),
+            json!({"choices": [{"delta": {"content": "done"}}]}).to_string(),
+        ]);
+        let mut agent = agent(vec![replies], 4, dir).await;
+
+        let mut seen = Seen::default();
+        let answer = agent.run("say hi", &mut seen.callback()).await.unwrap();
+
+        assert_eq!(answer, "all done");
+        assert_eq!(
+            seen.0,
+            vec![
+                (Delta::Text, "all ".to_string()),
+                (Delta::Text, "done".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn streams_reasoning_separately_from_the_answer() {
+        let dir = crate::tools::temp_dir("agent-thinking");
+        let replies = sse(&[
+            json!({"choices": [{"delta": {"reasoning": "thinking"}}]}).to_string(),
+            json!({"choices": [{"delta": {"content": "answer"}}]}).to_string(),
+        ]);
+        let mut agent = agent(vec![replies], 4, dir).await;
+
+        let mut seen = Seen::default();
+        let answer = agent.run("think", &mut seen.callback()).await.unwrap();
+
+        assert_eq!(answer, "answer");
+        assert_eq!(
+            seen.0,
+            vec![
+                (Delta::Thinking, "thinking".to_string()),
+                (Delta::Text, "answer".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reassembles_tool_arguments_split_across_events() {
+        let dir = crate::tools::temp_dir("agent-split-args");
+        let mut agent = agent(
+            vec![
+                sse(&[
+                    json!({"choices": [{"delta": {"tool_calls": [
+                        {"index": 0, "id": "call_1", "function": {"name": "write", "arguments": "{\"path\":\"a.tx"}}
+                    ]}}]})
+                    .to_string(),
+                    json!({"choices": [{"delta": {"tool_calls": [
+                        {"index": 0, "function": {"arguments": "t\",\"content\":\"hi\"}"}}
+                    ]}}]})
+                    .to_string(),
+                ]),
+                text_reply("wrote it"),
+            ],
+            4,
+            dir.clone(),
+        )
+        .await;
+
+        assert_eq!(
+            agent.run("write", &mut |_, _| {}).await.unwrap(),
+            "wrote it"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(dir.join("a.txt")).await.unwrap(),
+            "hi"
+        );
     }
 
     #[tokio::test]
@@ -231,7 +357,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(agent.run("create a.txt").await.unwrap(), "wrote it");
+        assert_eq!(
+            agent.run("create a.txt", &mut |_, _| {}).await.unwrap(),
+            "wrote it"
+        );
         assert_eq!(
             tokio::fs::read_to_string(dir.join("a.txt")).await.unwrap(),
             "hi"
@@ -260,7 +389,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(agent.run("rename it").await.unwrap(), "done");
+        assert_eq!(
+            agent.run("rename it", &mut |_, _| {}).await.unwrap(),
+            "done"
+        );
         assert_eq!(
             tokio::fs::read_to_string(dir.join("a.txt")).await.unwrap(),
             "after\n"
@@ -281,7 +413,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(agent.run("read it").await.unwrap(), "gave up");
+        assert_eq!(
+            agent.run("read it", &mut |_, _| {}).await.unwrap(),
+            "gave up"
+        );
     }
 
     #[tokio::test]
@@ -297,7 +432,7 @@ mod tests {
         )
         .await;
 
-        let error = agent.run("loop forever").await.unwrap_err();
+        let error = agent.run("loop forever", &mut |_, _| {}).await.unwrap_err();
         assert!(error.to_string().contains("2 steps"), "{error}");
     }
 }

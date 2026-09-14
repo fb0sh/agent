@@ -4,13 +4,14 @@ mod agent;
 mod llm;
 mod tools;
 
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use crate::agent::Agent;
-use crate::llm::{Api, Llm};
+use crate::llm::{Api, Delta, Llm};
 use crate::tools::Tools;
 
 /// A minimal coding agent that works in the current directory with four tools:
@@ -98,12 +99,48 @@ async fn run() -> Result<()> {
     let tools = Tools::new(cwd);
     let mut agent = Agent::new(llm, tools, args.max_iterations);
 
-    let answer = agent.run(&task).await?;
-    let answer = answer.trim();
-    if answer.is_empty() {
+    // The answer streams straight to stdout; reasoning stays on stderr, dimmed.
+    let mut streamed = false;
+    let mut ended_with_newline = true;
+    let mut thinking_open = false;
+    let answer = agent
+        .run(&task, &mut |delta, chunk| {
+            match delta {
+                Delta::Text => {
+                    // Reasoning came first: end its dim line before the answer.
+                    if thinking_open {
+                        eprintln!();
+                        thinking_open = false;
+                    }
+                    streamed = true;
+                    ended_with_newline = chunk.ends_with('\n');
+                    let mut out = io::stdout().lock();
+                    let _ = out.write_all(chunk.as_bytes());
+                    let _ = out.flush();
+                }
+                Delta::Thinking if io::stderr().is_terminal() => {
+                    let mut err = io::stderr().lock();
+                    let _ = write!(err, "\x1b[2m{chunk}\x1b[0m");
+                    let _ = err.flush();
+                    thinking_open = !chunk.ends_with('\n');
+                }
+                Delta::Thinking => {}
+            }
+        })
+        .await?;
+    if thinking_open {
+        eprintln!();
+    }
+
+    if streamed {
+        if !ended_with_newline {
+            println!();
+        }
+    } else if answer.trim().is_empty() {
         eprintln!("(the model finished without an answer)");
     } else {
-        println!("{answer}");
+        // Nothing was streamed, so print the answer we got.
+        println!("{}", answer.trim_end());
     }
     Ok(())
 }
