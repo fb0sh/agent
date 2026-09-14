@@ -11,7 +11,7 @@ mini-agent "修复当前项目的编译错误"
 ```
 
 ```
-task → LLM → text or tool calls → run tools → feed results back → repeat → final answer
+task → model → text or tool calls → run tools → feed results back → repeat → final answer
 ```
 
 The package is both a library (`agent`) and a thin CLI (`mini-agent`) over it.
@@ -29,10 +29,9 @@ cargo build --release        # binary: target/release/mini-agent
 export OPENAI_API_KEY=sk-...
 mini-agent "add a --verbose flag to the CLI"
 
-# Any compatible endpoint: just point --base-url at it
+# Any compatible endpoint: point --base-url at it
 mini-agent --base-url https://api.deepseek.com --model deepseek-chat "check this project"
-mini-agent --base-url https://openrouter.ai/api/v1 --model qwen/qwen3-coder "sort the imports"
-mini-agent --base-url http://localhost:11434/v1 --model qwen2.5-coder "explain src/main.rs"
+mini-agent --base-url http://localhost:11434/v1 --model qwen2.5-coder "sort the imports"
 ```
 
 Any task can be given as several words (`mini-agent fix the build`).
@@ -43,12 +42,14 @@ Any task can be given as several words (`mini-agent fix the build`).
 | --- | --- | --- |
 | `--model <MODEL>` | `MINI_AGENT_MODEL` | `gpt-4o-mini` |
 | `--base-url <URL>` | `MINI_AGENT_BASE_URL` | `https://api.openai.com/v1` |
-| `--api-key <KEY>` | `MINI_AGENT_API_KEY` | `OPENAI_API_KEY` |
+| `--api-key <KEY>` | `MINI_AGENT_API_KEY` | `OPENAI_API_KEY`, or none at all |
 | `-C, --cwd <DIR>` | `MINI_AGENT_CWD` | current directory |
 | `--max-iterations <N>` | `MINI_AGENT_MAX_ITERATIONS` | `32` |
 | `-v, --verbose` | `MINI_AGENT_VERBOSE` | off |
 
-Priority: CLI flag → environment variable → default.
+Priority: CLI flag → environment variable → default. With no key at all the
+request is sent without an `Authorization` header, which is what local servers
+such as Ollama and LM Studio want.
 
 A `.env` file in the working directory is loaded automatically at startup
 (`cp .env.example .env`). It only fills in variables that are not already set,
@@ -56,55 +57,93 @@ so the precedence above still holds. `.env` is git-ignored; never commit keys.
 
 ## Library
 
-```rust
-use agent::{Agent, Llm, Output, Tools};
+Three pieces, two of them extension points:
 
-let llm = Llm::new(Some("deepseek-chat".into()), None, api_key)?;
-let mut agent = Agent::new(llm, Tools::new(cwd), 32, Output::Quiet);
-
-// Text and reasoning arrive as they are generated; the return value is the
-// final answer. `Output::Quiet` means the library itself prints nothing.
-let answer = agent.run("fix the build", &mut |delta, chunk| print!("{chunk}")).await?;
+```text
+Agent<M: Model, T: Toolbox>
+   ├── M: Model      OpenAiCompatible (add your own protocol here)
+   └── T: Toolbox    CodingTools      (add or replace tools here)
 ```
 
-`llm.rs` is the only module that knows the wire format, `agent.rs` is the loop,
-`tools/` is the four tools bound to one working directory. Adding a tool means a
-new `tools/<name>.rs`, its `definition()`, and one arm in `Tools::execute`.
+```rust
+use agent::{Agent, CodingTools, Event, OpenAiCompatible, OpenAiConfig};
+
+let model = OpenAiCompatible::new(
+    OpenAiCompatible::builder()
+        .model("deepseek-chat")
+        .base_url("https://api.deepseek.com")
+        .api_key(api_key)
+        .timeout(Duration::from_secs(300))
+        .header("x-tenant", "acme")
+        // Anything this crate does not name goes through as-is:
+        .param("reasoning_effort", "high")
+        .param("temperature", 0.2),
+)?;
+
+let tools = CodingTools::new(cwd)
+    .exec_timeout(Duration::from_secs(1800))
+    .max_output(1024 * 1024)
+    .read_limit(500);
+
+let mut agent = Agent::new(model, tools).max_iterations(64);
+
+// The library never prints: text, reasoning and tool traffic arrive as events.
+let answer = agent
+    .run("fix the build", &mut |event| match event {
+        Event::Text(chunk) => print!("{chunk}"),
+        Event::ToolCall { name, arguments } => eprintln!("{name} {arguments}"),
+        _ => {}
+    })
+    .await?;
+```
+
+* `OpenAiConfig` is a plain struct with chainable setters, so anything not named
+  there (`top_p`, `max_completion_tokens`, `seed`, `tool_choice`,
+  `response_format`, `parallel_tool_calls`, vendor extensions) is passed through
+  with `.param(name, value)` and nothing has to be added to the crate.
+* `api_key` is optional, so endpoints that need no key work as they are.
+* A host that wants a different protocol implements `Model`; a host that wants
+  different tools implements `Toolbox`. Neither the agent nor the other side
+  changes.
+* `agent.messages()`, `messages_mut()` and `clear()` expose the conversation, so
+  sessions can be saved, restored, trimmed or fed into the model again.
+* `Agent::system_prompt(...)` replaces the built-in prompt.
 
 ## Tools
 
 | Tool | Arguments | Behaviour |
 | --- | --- | --- |
-| `read` | `path`, `offset?`, `limit?` (1-based, 2000 lines by default) | streams a window of a UTF-8 file, output clipped at 100 KB |
+| `read` | `path`, `offset?`, `limit?` (1-based, 2000 lines by default) | streams a window of a UTF-8 file, clipped to `max_output` |
 | `write` | `path`, `content` | creates or fully overwrites, creating parent directories |
 | `edit` | `path`, `old`, `new` | exact replacement; 0 or >1 matches is an error |
-| `exec` | `command` | `sh -c` in the working directory, 120 s timeout, exit code + stdout + stderr |
+| `exec` | `command` | platform shell (`sh -c`, `cmd /C`), 120 s timeout, exit code + stdout + stderr |
 
-A failing tool does not abort the run: the error text goes back to the model as
-the tool result so it can correct itself.
+Relative paths resolve against the working directory; absolute paths are
+accepted, since `exec` can reach the whole filesystem anyway. A failing tool does
+not abort the run: the error text goes back to the model as the tool result so it
+can correct itself — including unparseable arguments, which are reported
+verbatim instead of being silently replaced with `{}`.
+
+`exec` keeps reading a runaway command after the output limit is reached and
+discards the rest, rather than leaving the process blocked on a full pipe.
 
 ## Architecture
 
 ```
-main.rs    CLI, config precedence, rendering
-└── lib.rs      the library: agent, llm, tools
+main.rs    CLI, config precedence, all terminal rendering
+└── lib.rs      the vocabulary (Message, ToolCall, Event, …) and the two traits
     ├── agent.rs    the loop: chat → tool calls → results → chat …
-    ├── llm.rs      OpenAI-compatible protocol: request, SSE stream, parsing
-    └── tools/      read, write, edit, exec bound to one cwd
+    ├── llm.rs      OpenAiCompatible + OpenAiConfig: request, SSE stream, parsing
+    └── tools/      CodingTools: read, write, edit, exec bound to one cwd
 ```
 
-* The library never writes to the terminal. Text and reasoning arrive through
-  the callback given to `Agent::run`; progress output is opt-in via `Output`
-  (`Quiet` / `Progress` / `Verbose`), and the CLI picks it.
-* Progress uses one line and no scrolling: the model's reasoning rewritten in
-  place (dimmed, clipped to one line wide), then the answer taking that line
-  over. Nothing else reaches stderr, so `mini-agent "..." > answer.md` captures
-  exactly the answer.
-* `--verbose` also prints each tool call with up to three lines of its output.
-  Note that some gateways stream only the reasoning and deliver the answer text
-  in one burst at the end — the reasoning line is the live part there.
-* No provider registry, no tool trait, no service layer: `chat` is one path,
-  tools are `match` arms in `Tools::execute`.
+* The library prints nothing and owns no rendering policy: `Agent::run` reports
+  `Event`s and the CLI decides what they look like.
+* The CLI uses one line and never scrolls: the model's reasoning is rewritten in
+  place (dimmed, clipped to one line wide), then the answer takes that line over.
+  `--verbose` adds each tool call with up to three lines of its output. Nothing
+  else reaches stderr, so `mini-agent "..." > answer.md` captures exactly the
+  answer.
 * Tool calls run one at a time on purpose — `write`/`edit`/`exec` depend on each
   other's effects.
 
@@ -114,10 +153,12 @@ main.rs    CLI, config precedence, rendering
 cargo test
 ```
 
-Covers `read` (window, missing file, bad offset), `write` (create, overwrite),
-`edit` (0/1/many matches), `exec` (success, non-zero exit, timeout),
-`Tools`/`clip`/`resolve`, request building, stream parsing (text, reasoning and
-tool arguments split across events), and the agent loop against a throwaway
-OpenAI-compatible SSE server: text answer, streaming deltas, reasoning kept out
-of the answer, reassembly of split tool arguments, one tool call, several rounds,
-tool errors fed back, and hitting `--max-iterations`.
+Covers `read` (window, configured limit, clipping, bad offset, missing file),
+`write` (create, overwrite), `edit` (0/1/many matches), `exec` (success, non-zero
+exit, timeout, draining past the output limit), the toolbox dispatch, request
+building (history, tools, passthrough params), stream parsing (text, reasoning,
+tool arguments split across events, unparseable arguments), the HTTP layer
+against a throwaway server (params, headers, auth optional, error bodies), and
+the agent loop against a scripted model: tool round trips, tool errors as
+results, history, step limit and system prompt. `Agent` and `Toolbox` being
+generic is what makes those loop tests need no network at all.

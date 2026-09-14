@@ -1,7 +1,9 @@
-//! The four tools the agent can call.
+//! The four built-in tools, and the [`Toolbox`] implementation that dispatches
+//! to them.
 //!
-//! There is no registry and no trait: a tool is a `match` arm, and adding one
-//! means adding a file, its `definition()` and its arm in [`Tools::execute`].
+//! There is no registry and no trait per tool: a tool is a module with a
+//! `definition()` and a `run()`, and one `match` arm in [`Toolbox::execute`].
+//! Hosts that need different tools implement [`Toolbox`] themselves.
 
 mod edit;
 mod exec;
@@ -9,64 +11,90 @@ mod read;
 mod write;
 
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 
-use crate::llm::{ToolCall, ToolResult};
+use crate::{ToolCall, ToolDefinition, Toolbox, clip};
 
-/// A tool as every supported API wants to see it.
-pub struct ToolDefinition {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub parameters: Value,
-}
+const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_MAX_OUTPUT: usize = 100 * 1024;
+const DEFAULT_READ_LIMIT: usize = 2000;
 
-/// The fixed tool set, bound to one working directory.
-pub struct Tools {
+/// `read`, `write`, `edit` and `exec`, bound to one working directory.
+///
+/// ```no_run
+/// # use agent::CodingTools;
+/// # use std::time::Duration;
+/// let tools = CodingTools::new(std::env::current_dir().unwrap())
+///     .exec_timeout(Duration::from_secs(1800))
+///     .max_output(1024 * 1024);
+/// ```
+pub struct CodingTools {
+    /// Every relative path and every command is resolved against this.
     pub cwd: PathBuf,
+    pub exec_timeout: Duration,
+    pub max_output: usize,
+    pub read_limit: usize,
 }
 
-impl Tools {
+impl CodingTools {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            exec_timeout: DEFAULT_EXEC_TIMEOUT,
+            max_output: DEFAULT_MAX_OUTPUT,
+            read_limit: DEFAULT_READ_LIMIT,
+        }
     }
 
-    pub fn definitions(&self) -> Vec<ToolDefinition> {
+    /// How long `exec` may run before it is killed.
+    pub fn exec_timeout(mut self, timeout: Duration) -> Self {
+        self.exec_timeout = timeout;
+        self
+    }
+
+    /// How much output a tool may return, in bytes. `read` and `exec` clip to
+    /// this; `exec` keeps draining a runaway command instead of blocking it.
+    pub fn max_output(mut self, bytes: usize) -> Self {
+        self.max_output = bytes.max(1);
+        self
+    }
+
+    /// Default line count for `read` when the model does not pass `limit`.
+    pub fn read_limit(mut self, lines: usize) -> Self {
+        self.read_limit = lines.max(1);
+        self
+    }
+}
+
+impl Toolbox for CodingTools {
+    fn definitions(&self) -> Vec<ToolDefinition> {
         vec![
-            read::definition(),
+            read::definition(self.read_limit),
             write::definition(),
             edit::definition(),
-            exec::definition(),
+            exec::definition(self.exec_timeout),
         ]
     }
 
-    /// Run one tool call. A failure is not an error for the caller: it becomes
-    /// `error: ...` output so the model can read it and correct itself instead
-    /// of the agent aborting the whole run.
-    pub async fn execute(&self, call: &ToolCall) -> ToolResult {
-        let outcome = match call.name.as_str() {
-            "read" => read::run(&self.cwd, &call.arguments).await,
-            "write" => write::run(&self.cwd, &call.arguments).await,
-            "edit" => edit::run(&self.cwd, &call.arguments).await,
-            "exec" => exec::run(&self.cwd, &call.arguments).await,
+    async fn execute(&self, call: &ToolCall) -> Result<String> {
+        match call.name.as_str() {
+            "read" => read::run(self, &call.arguments).await,
+            "write" => write::run(self, &call.arguments).await,
+            "edit" => edit::run(self, &call.arguments).await,
+            "exec" => exec::run(self, &call.arguments).await,
             other => Err(anyhow!(
                 "unknown tool {other:?}: available tools are read, write, edit, exec"
             )),
-        };
-        ToolResult {
-            id: call.id.clone(),
-            name: call.name.clone(),
-            output: match outcome {
-                Ok(output) => output,
-                Err(error) => format!("error: {error:#}"),
-            },
         }
     }
 }
 
 /// Resolve a tool path against the working directory and normalize `.` / `..`
-/// lexically, so tools do not wander off by accident.
+/// lexically. Absolute paths are accepted as they are: `exec` can reach the
+/// whole filesystem anyway, so a path sandbox here would be theatre.
 fn resolve(cwd: &Path, path: &str) -> Result<PathBuf> {
     if path.trim().is_empty() {
         bail!("`path` must not be empty");
@@ -97,23 +125,17 @@ fn resolve(cwd: &Path, path: &str) -> Result<PathBuf> {
 fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     match args.get(key).and_then(Value::as_str) {
         Some(value) => Ok(value),
-        None => bail!("missing string argument `{key}` in {args}"),
+        None => bail!(
+            "missing string argument `{key}` in {}",
+            clip(&args.to_string(), 300)
+        ),
     }
 }
 
-/// Cut `text` down to `max` bytes on a char boundary, marking the cut.
-pub(crate) fn clip(text: &str, max: usize) -> String {
-    if text.len() <= max {
-        return text.to_string();
-    }
-    let mut end = max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}\n[output truncated]", &text[..end])
-}
+/// The path description every file tool shares.
+const PATH_DESCRIPTION: &str = "Path to a UTF-8 text file. Relative paths resolve against the working \
+     directory; absolute paths are accepted.";
 
-/// A fresh scratch directory for the tests of this crate.
 #[cfg(test)]
 pub fn temp_dir(test: &str) -> PathBuf {
     let dir = std::env::temp_dir()
@@ -127,14 +149,6 @@ pub fn temp_dir(test: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn clip_keeps_short_text_and_marks_long_text() {
-        assert_eq!(clip("abc", 10), "abc");
-        assert_eq!(clip("abcdef", 3), "abc\n[output truncated]");
-        // Must not split a multi-byte character.
-        assert_eq!(clip("日本語", 4), "日\n[output truncated]");
-    }
 
     #[test]
     fn resolve_normalizes_dots_and_keeps_absolute_paths() {
@@ -160,5 +174,42 @@ mod tests {
         assert_eq!(arg_str(&args, "path").unwrap(), "a.rs");
         let error = arg_str(&args, "content").unwrap_err().to_string();
         assert!(error.contains("content"), "{error}");
+    }
+
+    /// Unparseable arguments reach the tool as a JSON string, so the error says
+    /// what the model actually sent.
+    #[test]
+    fn arg_str_shows_unparseable_arguments() {
+        let args = serde_json::Value::String("{\"path\":".to_string());
+        let error = arg_str(&args, "path").unwrap_err().to_string();
+        assert!(error.contains(r#"{\"path\":"#), "{error}");
+    }
+
+    #[tokio::test]
+    async fn dispatches_known_tools_and_rejects_unknown_ones() {
+        let dir = temp_dir("toolbox-dispatch");
+        let tools = CodingTools::new(dir.clone());
+        assert_eq!(tools.definitions().len(), 4);
+
+        let write = ToolCall {
+            id: "1".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({"path": "a.txt", "content": "hi"}),
+        };
+        assert!(
+            tools
+                .execute(&write)
+                .await
+                .unwrap()
+                .starts_with("wrote 2 bytes")
+        );
+
+        let unknown = ToolCall {
+            id: "2".into(),
+            name: "grep".into(),
+            arguments: serde_json::json!({}),
+        };
+        let error = tools.execute(&unknown).await.unwrap_err().to_string();
+        assert!(error.contains("unknown tool"), "{error}");
     }
 }

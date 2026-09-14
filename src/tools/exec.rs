@@ -1,6 +1,5 @@
 //! `exec` — run a shell command once, capture its output, kill it if it hangs.
 
-use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -9,38 +8,39 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
-use super::{ToolDefinition, arg_str, clip};
+use super::{CodingTools, arg_str};
+use crate::ToolDefinition;
 
-const TIMEOUT: Duration = Duration::from_secs(120);
-/// Per stream, so a runaway process cannot grow the result without bound.
-const MAX_STREAM: usize = 100 * 1024;
-const MAX_OUTPUT: usize = 100 * 1024;
-
-pub fn definition() -> ToolDefinition {
+pub fn definition(timeout: Duration) -> ToolDefinition {
     ToolDefinition {
-        name: "exec",
-        description: "Run a shell command in the working directory and return its exit code, \
-                      stdout and stderr. Non-zero exit codes are normal output. \
-                      The command is killed after 120 seconds and long output is truncated.",
+        name: "exec".into(),
+        description: format!(
+            "Run a shell command in the working directory and return its exit code, \
+             stdout and stderr. Non-zero exit codes are normal output. The command is \
+             killed after {} seconds and long output is truncated.",
+            timeout.as_secs()
+        ),
         parameters: json!({
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "Command line, run with `sh -c`."
+                    "description": "Command line, run by the platform shell (`sh -c` on Unix, `cmd /C` on Windows)."
                 }
             },
-            "required": ["command"]
+            "required": ["command"],
+            "additionalProperties": false
         }),
     }
 }
 
-pub async fn run(cwd: &Path, args: &Value) -> Result<String> {
-    run_with_timeout(cwd, args, TIMEOUT).await
+pub async fn run(tools: &CodingTools, args: &Value) -> Result<String> {
+    run_with(tools, args, tools.exec_timeout).await
 }
 
-async fn run_with_timeout(cwd: &Path, args: &Value, timeout: Duration) -> Result<String> {
+async fn run_with(tools: &CodingTools, args: &Value, timeout: Duration) -> Result<String> {
     let command_line = arg_str(args, "command")?;
+    let limit = tools.max_output;
 
     let mut command = if cfg!(windows) {
         let mut command = Command::new("cmd");
@@ -52,7 +52,7 @@ async fn run_with_timeout(cwd: &Path, args: &Value, timeout: Duration) -> Result
         command
     };
     command
-        .current_dir(cwd)
+        .current_dir(&tools.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -65,8 +65,8 @@ async fn run_with_timeout(cwd: &Path, args: &Value, timeout: Duration) -> Result
     // Read both pipes while the child runs: a full pipe would otherwise block it.
     let stdout = child.stdout.take().context("no stdout pipe")?;
     let stderr = child.stderr.take().context("no stderr pipe")?;
-    let read_stdout = tokio::spawn(read_capped(stdout));
-    let read_stderr = tokio::spawn(read_capped(stderr));
+    let read_stdout = tokio::spawn(drain(stdout, limit));
+    let read_stderr = tokio::spawn(drain(stderr, limit));
 
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(status) => status.context("failed to wait for the command")?,
@@ -79,32 +79,52 @@ async fn run_with_timeout(cwd: &Path, args: &Value, timeout: Duration) -> Result
         }
     };
 
-    let stdout = read_stdout.await.context("stdout reader panicked")??;
-    let stderr = read_stderr.await.context("stderr reader panicked")??;
+    let (stdout, stdout_cut) = read_stdout.await.context("stdout reader panicked")??;
+    let (stderr, stderr_cut) = read_stderr.await.context("stderr reader panicked")??;
 
     let code = match status.code() {
         Some(code) => code.to_string(),
         None => "killed by signal".to_string(),
     };
     let mut output = format!("exit code: {code}");
-    if !stdout.is_empty() {
-        output.push_str("\nstdout:\n");
-        output.push_str(&String::from_utf8_lossy(&stdout));
+    for (name, bytes, cut) in [
+        ("stdout", &stdout, stdout_cut),
+        ("stderr", &stderr, stderr_cut),
+    ] {
+        if bytes.is_empty() {
+            continue;
+        }
+        output.push_str(&format!("\n{name}:\n"));
+        output.push_str(&String::from_utf8_lossy(bytes));
+        if cut {
+            output.push_str(&format!("\n[{name} truncated]"));
+        }
     }
-    if !stderr.is_empty() {
-        output.push_str("\nstderr:\n");
-        output.push_str(&String::from_utf8_lossy(&stderr));
-    }
-    Ok(clip(&output, MAX_OUTPUT))
+    Ok(output)
 }
 
-async fn read_capped(reader: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
-    let mut buffer = Vec::new();
-    reader
-        .take((MAX_STREAM + 1) as u64)
-        .read_to_end(&mut buffer)
-        .await?;
-    Ok(buffer)
+/// Keep the first `limit` bytes and go on reading to EOF.
+///
+/// Stopping the read instead would leave the writer blocked on a full pipe and
+/// turn a chatty command into a timeout, so the rest is read and discarded.
+async fn drain(reader: impl AsyncRead + Unpin, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut reader = reader;
+    let mut saved = Vec::new();
+    let mut buffer = vec![0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok((saved, truncated));
+        }
+        let room = limit.saturating_sub(saved.len());
+        if room > 0 {
+            saved.extend_from_slice(&buffer[..read.min(room)]);
+        }
+        if read > room {
+            truncated = true;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -118,24 +138,22 @@ mod tests {
         tokio::fs::write(dir.join("marker.txt"), "hi")
             .await
             .unwrap();
+        let tools = CodingTools::new(dir.clone());
 
-        let output = run(&dir, &json!({"command": "cat marker.txt && pwd"}))
+        let output = run(&tools, &json!({"command": "cat marker.txt && pwd"}))
             .await
             .unwrap();
 
         assert!(output.contains("exit code: 0"), "{output}");
         assert!(output.contains("hi"), "{output}");
-        assert!(
-            output.contains(&dir.display().to_string()),
-            "cwd not used: {output}"
-        );
+        assert!(output.contains(&dir.display().to_string()), "{output}");
     }
 
     #[tokio::test]
     async fn returns_non_zero_exit_codes_as_output() {
-        let dir = temp_dir("exec-fail");
+        let tools = CodingTools::new(temp_dir("exec-fail"));
 
-        let output = run(&dir, &json!({"command": "echo boom >&2; exit 3"}))
+        let output = run(&tools, &json!({"command": "echo boom >&2; exit 3"}))
             .await
             .unwrap();
 
@@ -144,17 +162,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn times_out_instead_of_hanging() {
-        let dir = temp_dir("exec-timeout");
+    async fn honours_the_configured_timeout() {
+        let tools =
+            CodingTools::new(temp_dir("exec-timeout")).exec_timeout(Duration::from_millis(200));
 
-        let error = run_with_timeout(
-            &dir,
-            &json!({"command": "sleep 30"}),
-            Duration::from_millis(200),
+        let error = run(&tools, &json!({"command": "sleep 30"}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+    }
+
+    /// A command that floods its pipe must be drained, not blocked: it should
+    /// exit normally with truncated output instead of hitting the timeout.
+    #[tokio::test]
+    async fn drains_past_the_output_limit_without_blocking() {
+        let tools = CodingTools::new(temp_dir("exec-drain"))
+            .max_output(1024)
+            .exec_timeout(Duration::from_secs(10));
+
+        let output = run(
+            &tools,
+            &json!({"command": "i=0; while [ $i -lt 20000 ]; do echo aaaaaaaaaaaaaaaaaaaa; i=$((i+1)); done"}),
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(output.contains("exit code: 0"), "{output}");
+        assert!(output.contains("[stdout truncated]"), "{output}");
+        assert!(
+            output.len() < 2048,
+            "output not clipped: {} bytes",
+            output.len()
+        );
     }
 }

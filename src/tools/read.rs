@@ -1,46 +1,45 @@
 //! `read` — return a window of a UTF-8 text file.
 
-use std::path::Path;
-
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use super::{ToolDefinition, arg_str, clip, resolve};
+use super::{CodingTools, PATH_DESCRIPTION, arg_str, resolve};
+use crate::{ToolDefinition, clip};
 
-const DEFAULT_LIMIT: usize = 2000;
-const MAX_OUTPUT: usize = 100 * 1024;
-
-pub fn definition() -> ToolDefinition {
+pub fn definition(limit: usize) -> ToolDefinition {
     ToolDefinition {
-        name: "read",
-        description: "Read a UTF-8 text file. Returns `limit` lines starting at line `offset` \
-                      (1-based). Reading a large file without offset/limit returns its head only.",
+        name: "read".into(),
+        description: format!(
+            "Read a UTF-8 text file. Returns `limit` lines starting at line `offset` \
+             (1-based, {limit} lines by default). Reading a large file without \
+             offset/limit returns its head only."
+        ),
         parameters: json!({
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "File to read, relative to the working directory."
-                },
+                "path": {"type": "string", "description": PATH_DESCRIPTION},
                 "offset": {
                     "type": "integer",
+                    "minimum": 1,
                     "description": "First line to return, 1-based. Defaults to 1."
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of lines to return. Defaults to 2000."
+                    "minimum": 1,
+                    "description": "Maximum number of lines to return."
                 }
             },
-            "required": ["path"]
+            "required": ["path"],
+            "additionalProperties": false
         }),
     }
 }
 
-pub async fn run(cwd: &Path, args: &Value) -> Result<String> {
-    let path = resolve(cwd, arg_str(args, "path")?)?;
+pub async fn run(tools: &CodingTools, args: &Value) -> Result<String> {
+    let path = resolve(&tools.cwd, arg_str(args, "path")?)?;
     let offset = count_arg(args, "offset")?.unwrap_or(1);
-    let limit = count_arg(args, "limit")?.unwrap_or(DEFAULT_LIMIT);
+    let limit = count_arg(args, "limit")?.unwrap_or(tools.read_limit);
 
     let file = tokio::fs::File::open(&path)
         .await
@@ -82,7 +81,7 @@ pub async fn run(cwd: &Path, args: &Value) -> Result<String> {
             offset + selected.len() - 1
         );
     }
-    Ok(clip(&text, MAX_OUTPUT))
+    Ok(clip(&text, tools.max_output))
 }
 
 fn count_arg(args: &Value, key: &str) -> Result<Option<usize>> {
@@ -90,8 +89,9 @@ fn count_arg(args: &Value, key: &str) -> Result<Option<usize>> {
         None | Some(Value::Null) => Ok(None),
         Some(value) => value
             .as_u64()
-            .map(|n| Some(n.max(1) as usize))
-            .with_context(|| format!("`{key}` must be a positive integer, got {value}")),
+            .filter(|n| *n >= 1)
+            .map(|n| Some(n as usize))
+            .with_context(|| format!("`{key}` must be an integer >= 1, got {value}")),
     }
 }
 
@@ -106,8 +106,9 @@ mod tests {
         tokio::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n")
             .await
             .unwrap();
+        let tools = CodingTools::new(dir);
 
-        let output = run(&dir, &json!({"path": "a.txt"})).await.unwrap();
+        let output = run(&tools, &json!({"path": "a.txt"})).await.unwrap();
         assert_eq!(output, "one\ntwo\nthree\n");
     }
 
@@ -117,27 +118,60 @@ mod tests {
         tokio::fs::write(dir.join("a.txt"), "1\n2\n3\n4\n5\n")
             .await
             .unwrap();
+        let tools = CodingTools::new(dir);
 
-        let output = run(&dir, &json!({"path": "a.txt", "offset": 2, "limit": 2}))
+        let output = run(&tools, &json!({"path": "a.txt", "offset": 2, "limit": 2}))
             .await
             .unwrap();
         assert!(output.starts_with("[truncated: lines 2-3]"), "{output}");
         assert!(output.ends_with("2\n3\n"), "{output}");
 
-        let tail = run(&dir, &json!({"path": "a.txt", "offset": 4}))
+        let tail = run(&tools, &json!({"path": "a.txt", "offset": 4}))
             .await
             .unwrap();
         assert_eq!(tail, "4\n5\n");
     }
 
     #[tokio::test]
-    async fn reports_missing_files_and_offsets_past_the_end() {
+    async fn uses_the_configured_default_limit() {
+        let dir = temp_dir("read-config-limit");
+        tokio::fs::write(dir.join("a.txt"), "1\n2\n3\n")
+            .await
+            .unwrap();
+        let tools = CodingTools::new(dir).read_limit(2);
+
+        let output = run(&tools, &json!({"path": "a.txt"})).await.unwrap();
+        assert!(output.starts_with("[truncated: lines 1-2]"), "{output}");
+        assert!(definition(2).description.contains("2 lines by default"));
+    }
+
+    #[tokio::test]
+    async fn clips_to_the_configured_output_limit() {
+        let dir = temp_dir("read-clip");
+        tokio::fs::write(dir.join("a.txt"), "x".repeat(500))
+            .await
+            .unwrap();
+        let tools = CodingTools::new(dir).max_output(100);
+
+        let output = run(&tools, &json!({"path": "a.txt"})).await.unwrap();
+        assert!(output.ends_with("[output truncated]"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn rejects_bad_offsets_and_reports_missing_files() {
         let dir = temp_dir("read-errors");
-        let missing = run(&dir, &json!({"path": "nope.txt"})).await.unwrap_err();
+        let tools = CodingTools::new(dir.clone());
+
+        let zero = run(&tools, &json!({"path": "a.txt", "offset": 0}))
+            .await
+            .unwrap_err();
+        assert!(zero.to_string().contains("integer >= 1"), "{zero}");
+
+        let missing = run(&tools, &json!({"path": "nope.txt"})).await.unwrap_err();
         assert!(missing.to_string().contains("failed to open"), "{missing}");
 
         tokio::fs::write(dir.join("a.txt"), "only\n").await.unwrap();
-        let past_end = run(&dir, &json!({"path": "a.txt", "offset": 9}))
+        let past_end = run(&tools, &json!({"path": "a.txt", "offset": 9}))
             .await
             .unwrap_err();
         assert!(past_end.to_string().contains("has 1 lines"), "{past_end}");
@@ -146,7 +180,7 @@ mod tests {
     #[tokio::test]
     async fn reports_missing_arguments() {
         let dir = temp_dir("read-args");
-        let error = run(&dir, &json!({})).await.unwrap_err();
+        let error = run(&CodingTools::new(dir), &json!({})).await.unwrap_err();
         assert!(error.to_string().contains("`path`"), "{error}");
     }
 }

@@ -1,36 +1,34 @@
 //! `write` — create or fully overwrite a file.
 
-use std::path::Path;
-
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use super::{ToolDefinition, arg_str, resolve};
+use super::{CodingTools, PATH_DESCRIPTION, arg_str, resolve};
+use crate::ToolDefinition;
 
 pub fn definition() -> ToolDefinition {
     ToolDefinition {
-        name: "write",
+        name: "write".into(),
         description: "Write a UTF-8 text file, creating it or replacing its whole content. \
-                      Missing parent directories are created. Prefer `edit` for small changes.",
+                      Missing parent directories are created. Prefer `edit` for small changes."
+            .into(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "File to write, relative to the working directory."
-                },
+                "path": {"type": "string", "description": PATH_DESCRIPTION},
                 "content": {
                     "type": "string",
                     "description": "Full content of the file."
                 }
             },
-            "required": ["path", "content"]
+            "required": ["path", "content"],
+            "additionalProperties": false
         }),
     }
 }
 
-pub async fn run(cwd: &Path, args: &Value) -> Result<String> {
-    let path = resolve(cwd, arg_str(args, "path")?)?;
+pub async fn run(tools: &CodingTools, args: &Value) -> Result<String> {
+    let path = resolve(&tools.cwd, arg_str(args, "path")?)?;
     let content = arg_str(args, "content")?;
 
     if let Some(parent) = path.parent() {
@@ -57,7 +55,9 @@ mod tests {
     #[tokio::test]
     async fn creates_a_file_and_its_parents() {
         let dir = temp_dir("write-create");
-        let output = run(&dir, &json!({"path": "a/b/c.txt", "content": "hello"}))
+        let tools = CodingTools::new(dir.clone());
+
+        let output = run(&tools, &json!({"path": "a/b/c.txt", "content": "hello"}))
             .await
             .unwrap();
 
@@ -74,10 +74,12 @@ mod tests {
         tokio::fs::write(dir.join("a.txt"), "old and long")
             .await
             .unwrap();
+        let tools = CodingTools::new(dir.clone());
 
-        run(&dir, &json!({"path": "a.txt", "content": "new"}))
+        run(&tools, &json!({"path": "a.txt", "content": "new"}))
             .await
             .unwrap();
+
         let written = tokio::fs::read_to_string(dir.join("a.txt")).await.unwrap();
         assert_eq!(written, "new");
     }
@@ -85,7 +87,9 @@ mod tests {
     #[tokio::test]
     async fn reports_missing_content() {
         let dir = temp_dir("write-args");
-        let error = run(&dir, &json!({"path": "a.txt"})).await.unwrap_err();
+        let error = run(&CodingTools::new(dir), &json!({"path": "a.txt"}))
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("`content`"), "{error}");
     }
 }

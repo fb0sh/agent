@@ -1,138 +1,118 @@
 //! The agent loop: call the model, run the tools it asks for, repeat.
-
-use std::io::{self, IsTerminal, Write};
+//!
+//! This is mechanism only: it holds no policy about rendering, retries or
+//! context management. Everything a host might want to decide is either a
+//! callback ([`Agent::run`]) or an accessor ([`Agent::messages`]).
 
 use anyhow::{Result, bail};
 
-use crate::llm::{Delta, Llm, Message, Response};
-use crate::tools::{ToolDefinition, Tools, clip};
+use crate::{Event, Message, Model, Response, ToolDefinition, ToolResult, Toolbox};
 
-const SYSTEM_PROMPT: &str = "\
+/// Used unless the host sets its own with [`Agent::system_prompt`].
+pub const DEFAULT_SYSTEM_PROMPT: &str = "\
 You are a coding agent working in the current directory.
-
-Use tools to inspect and modify files and execute commands when needed.
-
-Available tools:
-- read
-- write
-- edit
-- exec
-
+Use the available tools to inspect, modify, and validate the project.
 Inspect relevant files before editing.
-Prefer edit for small changes and write for complete files.
 Run relevant checks after modifications.";
 
-pub struct Agent {
-    llm: Llm,
-    tools: Tools,
-    definitions: Vec<ToolDefinition>,
-    messages: Vec<Message>,
+const DEFAULT_MAX_ITERATIONS: usize = 32;
+
+pub struct Agent<M: Model, T: Toolbox> {
+    model: M,
+    tools: T,
+    system_prompt: String,
     max_iterations: usize,
-    output: Output,
+    messages: Vec<Message>,
 }
 
-/// How much the agent reports while it works. The library prints nothing unless
-/// asked, so `Quiet` is the default choice for embedders.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Output {
-    /// Nothing at all: render the deltas yourself.
-    Quiet,
-    /// One line: the model's reasoning, overwriting itself in place, dimmed.
-    Progress,
-    /// The above, plus every tool call and its output.
-    Verbose,
-}
-
-impl Agent {
-    pub fn new(llm: Llm, tools: Tools, max_iterations: usize, output: Output) -> Self {
-        let definitions = tools.definitions();
+impl<M: Model, T: Toolbox> Agent<M, T> {
+    pub fn new(model: M, tools: T) -> Self {
         Self {
-            llm,
+            model,
             tools,
-            definitions,
-            messages: vec![Message::System(SYSTEM_PROMPT.to_string())],
-            max_iterations,
-            output,
+            system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
+            max_iterations: DEFAULT_MAX_ITERATIONS,
+            messages: Vec::new(),
         }
+    }
+
+    /// Replace the system prompt. Set it to `""` to send no system message.
+    pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = prompt.into();
+        self
+    }
+
+    /// Give up after this many model turns.
+    pub fn max_iterations(mut self, max_iterations: usize) -> Self {
+        self.max_iterations = max_iterations;
+        self
+    }
+
+    /// The conversation so far, so a host can save, restore, trim or inspect it.
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    pub fn messages_mut(&mut self) -> &mut Vec<Message> {
+        &mut self.messages
+    }
+
+    /// Forget the conversation, including the system prompt.
+    pub fn clear(&mut self) {
+        self.messages.clear();
     }
 
     /// Run one task to completion and return the model's final text.
     ///
-    /// Answer text and reasoning are passed to `on_delta` as they arrive, so the
-    /// caller decides where they go; the return value is the same final text.
-    pub async fn run(
-        &mut self,
-        task: &str,
-        on_delta: &mut dyn FnMut(Delta, &str),
-    ) -> Result<String> {
+    /// The system prompt is seeded only when the conversation is empty, so a
+    /// restored session keeps whatever it was saved with.
+    pub async fn run(&mut self, task: &str, on_event: &mut dyn FnMut(Event<'_>)) -> Result<String> {
+        if self.messages.is_empty() && !self.system_prompt.is_empty() {
+            self.messages
+                .push(Message::System(self.system_prompt.clone()));
+        }
         self.messages.push(Message::User(task.to_string()));
 
-        // One line of progress is all this prints: the model's reasoning
-        // overwriting itself, then the answer taking the line over. Tracking
-        // where the cursor is keeps the two from colliding.
-        let mut line = Line::Clean;
-        let reporting = self.output != Output::Quiet;
-        let verbose = self.output == Output::Verbose;
-        let mut thinking = String::new();
-
+        let definitions: Vec<ToolDefinition> = self.tools.definitions();
         for _ in 0..self.max_iterations {
-            thinking.clear();
-            let response = self
-                .llm
-                .chat(&self.messages, &self.definitions, &mut |delta, chunk| {
-                    match delta {
-                        // Reasoning replaces the previous line in place, so a
-                        // long chain of thought never scrolls the screen. It is
-                        // shown by default: on many gateways it is the only
-                        // output that actually arrives progressively.
-                        Delta::Thinking if reporting => {
-                            thinking.push_str(chunk);
-                            draw(&mut line, &format!("\x1b[2m{}\x1b[0m", tail(&thinking)));
-                        }
-                        Delta::Text => {
-                            // The answer needs the line: drop the indicator, once,
-                            // before the first chunk. Later chunks are just text.
-                            if line == Line::Ours {
-                                release(&mut line);
-                            }
-                            line = if chunk.ends_with('\n') {
-                                Line::Clean
-                            } else {
-                                Line::Answer
-                            };
-                        }
-                        _ => {}
-                    }
-                    on_delta(delta, chunk);
-                })
-                .await;
-            let Response { text, tool_calls } = response.inspect_err(|_| release(&mut line))?;
+            let Response { text, tool_calls } = self
+                .model
+                .chat(&self.messages, &definitions, on_event)
+                .await?;
 
             // No tool calls means the model is done talking.
             if tool_calls.is_empty() {
-                release(&mut line);
-                return Ok(text.unwrap_or_default());
+                let text = text.unwrap_or_default();
+                self.messages.push(Message::Assistant {
+                    text: text.clone(),
+                    calls: Vec::new(),
+                });
+                return Ok(text);
             }
 
-            // Tools run one at a time on purpose: write/edit/exec depend on each other.
+            // Tools run one at a time on purpose: write/edit/exec depend on each
+            // other's effects.
             let mut results = Vec::with_capacity(tool_calls.len());
             for call in &tool_calls {
-                if verbose {
-                    release(&mut line);
-                    eprintln!(
-                        "→ {}({})",
-                        call.name,
-                        clip(&call.arguments.to_string(), 160)
-                    );
-                }
-                let result = self.tools.execute(call).await;
-                if verbose {
-                    // At most a few lines of output, so the screen never scrolls away.
-                    for text in result.output.lines().take(TRACE_LINES) {
-                        eprintln!("  {}", clip(text, 160));
-                    }
-                }
-                results.push(result);
+                on_event(Event::ToolCall {
+                    name: &call.name,
+                    arguments: &call.arguments,
+                });
+                let output = match self.tools.execute(call).await {
+                    Ok(output) => output,
+                    // A failed tool is not a failed run: the model gets to read
+                    // the error and correct itself.
+                    Err(error) => format!("error: {error:#}"),
+                };
+                on_event(Event::ToolResult {
+                    name: &call.name,
+                    output: &output,
+                });
+                results.push(ToolResult {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    output,
+                });
             }
 
             self.messages.push(Message::Assistant {
@@ -149,351 +129,246 @@ impl Agent {
     }
 }
 
-/// How much tool output a verbose trace shows, so the screen never scrolls away.
-const TRACE_LINES: usize = 3;
-
-/// Reasoning is squeezed into one line this many columns wide, never more.
-const THINKING_WIDTH: usize = 60;
-
-/// True when progress output is worth showing, i.e. stderr is a terminal.
-fn on_terminal() -> bool {
-    io::stderr().is_terminal()
-}
-
-/// What the last line of the terminal currently holds.
-#[derive(Clone, Copy, PartialEq)]
-enum Line {
-    /// Nothing half-written.
-    Clean,
-    /// Streamed answer text, which is the user's output and must not be erased.
-    Answer,
-    /// A line we drew ourselves (dots, or reasoning): ours to overwrite.
-    Ours,
-}
-
-/// Draw over our own line, or start a fresh one.
-fn draw(line: &mut Line, text: &str) {
-    release(line);
-    if on_terminal() {
-        eprint!("{text}");
-        let _ = io::stderr().flush();
-        *line = Line::Ours;
-    }
-}
-
-/// Get back to a clean line: erase our own progress, or step past answer text.
-fn release(line: &mut Line) {
-    match *line {
-        Line::Ours if on_terminal() => {
-            eprint!("\r\x1b[2K");
-            let _ = io::stderr().flush();
-        }
-        Line::Answer => eprintln!(),
-        _ => {}
-    }
-    *line = Line::Clean;
-}
-
-/// The tail of `text` that fits in one line, with newlines flattened so it can
-/// never wrap: reasoning scrolls in place instead of scrolling the screen.
-fn tail(text: &str) -> String {
-    let mut width = 0;
-    let mut taken = Vec::new();
-    for character in text.chars().rev() {
-        let character = if character.is_whitespace() {
-            ' '
-        } else {
-            character
-        };
-        let columns = if character.is_ascii() { 1 } else { 2 };
-        if width + columns > THINKING_WIDTH {
-            break;
-        }
-        width += columns;
-        taken.push(character);
-    }
-    taken.iter().rev().collect()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    use serde_json::json;
+
     use super::*;
-    use std::path::PathBuf;
-    use std::time::Duration;
+    use crate::tools::temp_dir;
+    use crate::{CodingTools, ToolCall};
 
-    use serde_json::{Value, json};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
-
-    /// Wrap OpenAI stream events as an SSE body.
-    fn sse(events: &[String]) -> String {
-        events
-            .iter()
-            .map(|event| format!("data: {event}\n\n"))
-            .collect()
+    /// A model that plays back a script and records the prompts it was shown.
+    struct Scripted {
+        replies: RefCell<VecDeque<Response>>,
+        seen: Rc<RefCell<Vec<Vec<Message>>>>,
     }
 
-    fn text_reply(text: &str) -> String {
-        sse(&[json!({"choices": [{"delta": {"content": text}}]}).to_string()])
-    }
-
-    fn tool_reply(id: &str, name: &str, arguments: &Value) -> String {
-        sse(&[json!({"choices": [{"delta": {"tool_calls": [
-            {"index": 0, "id": id, "function": {"name": name, "arguments": arguments.to_string()}}
-        ]}}]})
-        .to_string()])
-    }
-
-    /// A throwaway OpenAI-compatible server that answers with `replies` in order.
-    async fn serve(replies: Vec<String>) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            for reply in replies {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    return;
-                };
-                read_request(&mut socket).await;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
-                    reply.len()
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.shutdown().await;
-                // Hold the socket until the client is done, then accept the next one.
-                let mut sink = [0u8; 1024];
-                let _ = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut sink)).await;
+    impl Scripted {
+        fn new(replies: Vec<Response>) -> Self {
+            Self {
+                replies: RefCell::new(replies.into()),
+                seen: Rc::new(RefCell::new(Vec::new())),
             }
-        });
-        format!("http://{address}")
-    }
+        }
 
-    async fn read_request(socket: &mut TcpStream) {
-        let mut request = Vec::new();
-        let mut chunk = [0u8; 4096];
-        loop {
-            let Ok(read) = socket.read(&mut chunk).await else {
-                return;
-            };
-            if read == 0 {
-                return;
-            }
-            request.extend_from_slice(&chunk[..read]);
-            let Some(head_end) = find(&request, b"\r\n\r\n") else {
-                continue;
-            };
-            let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
-            let length = head
-                .lines()
-                .find_map(|line| line.strip_prefix("content-length:"))
-                .and_then(|value| value.trim().parse::<usize>().ok())
-                .unwrap_or(0);
-            if request.len() >= head_end + 4 + length {
-                return;
-            }
+        /// A handle to the recorded prompts, since the agent owns the model.
+        fn seen(&self) -> Rc<RefCell<Vec<Vec<Message>>>> {
+            Rc::clone(&self.seen)
+        }
+
+        /// The conversation the model was shown on `turn`.
+        fn prompt(seen: &Rc<RefCell<Vec<Vec<Message>>>>, turn: usize) -> Vec<Message> {
+            seen.borrow()[turn].clone()
         }
     }
 
-    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack.windows(needle.len()).position(|w| w == needle)
+    impl Model for Scripted {
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _tools: &[ToolDefinition],
+            on_event: &mut dyn FnMut(Event<'_>),
+        ) -> Result<Response> {
+            self.seen.borrow_mut().push(messages.to_vec());
+            let reply = self
+                .replies
+                .borrow_mut()
+                .pop_front()
+                .expect("the script ran out of replies");
+            if let Some(text) = &reply.text {
+                on_event(Event::Text(text));
+            }
+            Ok(reply)
+        }
     }
 
-    async fn agent(replies: Vec<String>, steps: usize, cwd: PathBuf) -> Agent {
-        let base_url = serve(replies).await;
-        let llm = Llm::new(Some("test".into()), Some(base_url), "test".into()).unwrap();
-        Agent::new(llm, Tools::new(cwd), steps, Output::Quiet)
+    fn text(text: &str) -> Response {
+        Response {
+            text: Some(text.into()),
+            tool_calls: Vec::new(),
+        }
     }
 
-    /// A callback that keeps whatever the agent streams, for assertions.
+    fn call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments,
+        }
+    }
+
+    fn calls(list: Vec<ToolCall>) -> Response {
+        Response {
+            text: None,
+            tool_calls: list,
+        }
+    }
+
+    /// Events the agent reported, as compact strings.
     #[derive(Default)]
-    struct Seen(Vec<(Delta, String)>);
+    struct Seen(Vec<String>);
 
     impl Seen {
-        fn callback(&mut self) -> impl FnMut(Delta, &str) + '_ {
-            |delta, chunk| self.0.push((delta, chunk.to_string()))
+        fn callback(&mut self) -> impl FnMut(Event<'_>) + '_ {
+            |event| {
+                self.0.push(match event {
+                    Event::Text(text) => format!("text:{text}"),
+                    Event::Thinking(text) => format!("thinking:{text}"),
+                    Event::ToolCall { name, .. } => format!("call:{name}"),
+                    Event::ToolResult { output, .. } => format!("result:{output}"),
+                })
+            }
         }
     }
 
     #[tokio::test]
-    async fn returns_a_text_response() {
-        let dir = crate::tools::temp_dir("agent-text");
-        let mut agent = agent(vec![text_reply("all done")], 4, dir).await;
-
-        assert_eq!(
-            agent.run("say hi", &mut |_, _| {}).await.unwrap(),
-            "all done"
-        );
-    }
-
-    #[tokio::test]
-    async fn streams_text_as_it_arrives() {
-        let dir = crate::tools::temp_dir("agent-stream");
-        let replies = sse(&[
-            json!({"choices": [{"delta": {"content": "all "}}]}).to_string(),
-            json!({"choices": [{"delta": {"content": "done"}}]}).to_string(),
-        ]);
-        let mut agent = agent(vec![replies], 4, dir).await;
+    async fn returns_the_final_text_and_keeps_history() {
+        let dir = temp_dir("agent-text");
+        let model = Scripted::new(vec![text("all done")]);
+        let mut agent = Agent::new(model, CodingTools::new(dir));
 
         let mut seen = Seen::default();
         let answer = agent.run("say hi", &mut seen.callback()).await.unwrap();
 
         assert_eq!(answer, "all done");
-        assert_eq!(
-            seen.0,
-            vec![
-                (Delta::Text, "all ".to_string()),
-                (Delta::Text, "done".to_string())
-            ]
-        );
+        assert_eq!(seen.0, ["text:all done"]);
+        let roles: Vec<&str> = agent
+            .messages()
+            .iter()
+            .map(|message| match message {
+                Message::System(_) => "system",
+                Message::User(_) => "user",
+                Message::Assistant { .. } => "assistant",
+                Message::Tools(_) => "tools",
+            })
+            .collect();
+        assert_eq!(roles, ["system", "user", "assistant"]);
     }
 
     #[tokio::test]
-    async fn streams_reasoning_separately_from_the_answer() {
-        let dir = crate::tools::temp_dir("agent-thinking");
-        let replies = sse(&[
-            json!({"choices": [{"delta": {"reasoning": "thinking"}}]}).to_string(),
-            json!({"choices": [{"delta": {"content": "answer"}}]}).to_string(),
+    async fn runs_a_tool_and_feeds_the_result_back() {
+        let dir = temp_dir("agent-one-tool");
+        let model = Scripted::new(vec![
+            calls(vec![call(
+                "call_1",
+                "write",
+                json!({"path": "a.txt", "content": "hi"}),
+            )]),
+            text("wrote it"),
         ]);
-        let mut agent = agent(vec![replies], 4, dir).await;
+        let seen_prompts = model.seen();
+        let mut agent = Agent::new(model, CodingTools::new(dir.clone()));
 
         let mut seen = Seen::default();
-        let answer = agent.run("think", &mut seen.callback()).await.unwrap();
+        let answer = agent
+            .run("create a.txt", &mut seen.callback())
+            .await
+            .unwrap();
 
-        assert_eq!(answer, "answer");
-        assert_eq!(
-            seen.0,
-            vec![
-                (Delta::Thinking, "thinking".to_string()),
-                (Delta::Text, "answer".to_string())
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn reassembles_tool_arguments_split_across_events() {
-        let dir = crate::tools::temp_dir("agent-split-args");
-        let mut agent = agent(
-            vec![
-                sse(&[
-                    json!({"choices": [{"delta": {"tool_calls": [
-                        {"index": 0, "id": "call_1", "function": {"name": "write", "arguments": "{\"path\":\"a.tx"}}
-                    ]}}]})
-                    .to_string(),
-                    json!({"choices": [{"delta": {"tool_calls": [
-                        {"index": 0, "function": {"arguments": "t\",\"content\":\"hi\"}"}}
-                    ]}}]})
-                    .to_string(),
-                ]),
-                text_reply("wrote it"),
-            ],
-            4,
-            dir.clone(),
-        )
-        .await;
-
-        assert_eq!(
-            agent.run("write", &mut |_, _| {}).await.unwrap(),
-            "wrote it"
-        );
+        assert_eq!(answer, "wrote it");
         assert_eq!(
             tokio::fs::read_to_string(dir.join("a.txt")).await.unwrap(),
             "hi"
         );
+        assert!(seen.0[0].starts_with("call:write"), "{:?}", seen.0);
+        assert!(seen.0[1].contains("wrote 2 bytes"), "{:?}", seen.0);
+
+        // The second turn is shown the call and its result.
+        let prompt = Scripted::prompt(&seen_prompts, 1);
+        assert!(matches!(prompt[2], Message::Assistant { ref calls, .. } if calls.len() == 1));
+        assert!(matches!(prompt[3], Message::Tools(ref results) if results[0].id == "call_1"));
     }
 
     #[tokio::test]
-    async fn executes_one_tool_call() {
-        let dir = crate::tools::temp_dir("agent-one-tool");
-        let mut agent = agent(
-            vec![
-                tool_reply(
-                    "call_1",
-                    "write",
-                    &json!({"path": "a.txt", "content": "hi"}),
-                ),
-                text_reply("wrote it"),
-            ],
-            4,
-            dir.clone(),
-        )
-        .await;
-
-        assert_eq!(
-            agent.run("create a.txt", &mut |_, _| {}).await.unwrap(),
-            "wrote it"
-        );
-        assert_eq!(
-            tokio::fs::read_to_string(dir.join("a.txt")).await.unwrap(),
-            "hi"
-        );
-    }
-
-    #[tokio::test]
-    async fn loops_over_several_rounds_of_tool_calls() {
-        let dir = crate::tools::temp_dir("agent-multi-round");
+    async fn runs_several_rounds_and_several_calls() {
+        let dir = temp_dir("agent-rounds");
         tokio::fs::write(dir.join("a.txt"), "before\n")
             .await
             .unwrap();
-        let mut agent = agent(
-            vec![
-                tool_reply("call_1", "read", &json!({"path": "a.txt"})),
-                tool_reply(
-                    "call_2",
-                    "edit",
-                    &json!({"path": "a.txt", "old": "before", "new": "after"}),
-                ),
-                tool_reply("call_3", "exec", &json!({"command": "cat a.txt"})),
-                text_reply("done"),
-            ],
-            6,
-            dir.clone(),
-        )
-        .await;
+        let model = Scripted::new(vec![
+            calls(vec![
+                call("call_1", "read", json!({"path": "a.txt"})),
+                call("call_2", "exec", json!({"command": "true"})),
+            ]),
+            calls(vec![call(
+                "call_3",
+                "edit",
+                json!({"path": "a.txt", "old": "before", "new": "after"}),
+            )]),
+            text("done"),
+        ]);
+        let mut agent = Agent::new(model, CodingTools::new(dir.clone()));
 
-        assert_eq!(
-            agent.run("rename it", &mut |_, _| {}).await.unwrap(),
-            "done"
-        );
+        assert_eq!(agent.run("rename it", &mut |_| {}).await.unwrap(), "done");
         assert_eq!(
             tokio::fs::read_to_string(dir.join("a.txt")).await.unwrap(),
             "after\n"
         );
+        // system, user, assistant, tools, assistant, tools, assistant
+        assert_eq!(agent.messages().len(), 7);
     }
 
     #[tokio::test]
-    async fn feeds_tool_errors_back_to_the_model() {
-        let dir = crate::tools::temp_dir("agent-tool-error");
-        let mut agent = agent(
-            vec![
-                tool_reply("call_1", "read", &json!({"path": "missing.txt"})),
-                tool_reply("call_2", "read", &json!({"path": "nope"})),
-                text_reply("gave up"),
-            ],
-            4,
-            dir,
-        )
-        .await;
+    async fn turns_tool_errors_into_results() {
+        let dir = temp_dir("agent-tool-error");
+        let model = Scripted::new(vec![
+            calls(vec![call("call_1", "read", json!({"path": "missing.txt"}))]),
+            text("gave up"),
+        ]);
+        let mut agent = Agent::new(model, CodingTools::new(dir));
 
+        let mut seen = Seen::default();
         assert_eq!(
-            agent.run("read it", &mut |_, _| {}).await.unwrap(),
+            agent.run("read it", &mut seen.callback()).await.unwrap(),
             "gave up"
         );
+
+        let result = seen
+            .0
+            .iter()
+            .find(|event| event.starts_with("result:"))
+            .unwrap();
+        assert!(result.contains("error:"), "{result}");
     }
 
     #[tokio::test]
-    async fn stops_at_the_maximum_number_of_steps() {
-        let dir = crate::tools::temp_dir("agent-max-steps");
-        let mut agent = agent(
-            vec![
-                tool_reply("call_1", "read", &json!({"path": "a.txt"})),
-                tool_reply("call_2", "read", &json!({"path": "a.txt"})),
-            ],
-            2,
-            dir,
-        )
-        .await;
+    async fn stops_at_the_configured_step_limit() {
+        let dir = temp_dir("agent-max-steps");
+        let model = Scripted::new(vec![
+            calls(vec![call("call_1", "exec", json!({"command": "true"}))]),
+            calls(vec![call("call_2", "exec", json!({"command": "true"}))]),
+        ]);
+        let mut agent = Agent::new(model, CodingTools::new(dir)).max_iterations(2);
 
-        let error = agent.run("loop forever", &mut |_, _| {}).await.unwrap_err();
+        let error = agent.run("loop forever", &mut |_| {}).await.unwrap_err();
         assert!(error.to_string().contains("2 steps"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn seeds_the_system_prompt_once_and_can_be_cleared() {
+        let dir = temp_dir("agent-prompt");
+        let model = Scripted::new(vec![text("one"), text("two")]);
+        let mut agent = Agent::new(model, CodingTools::new(dir)).system_prompt("custom");
+
+        agent.run("first", &mut |_| {}).await.unwrap();
+        // Second run: same conversation, so no second system message.
+        agent.run("second", &mut |_| {}).await.unwrap();
+        let systems = agent
+            .messages()
+            .iter()
+            .filter(|message| matches!(message, Message::System(_)))
+            .count();
+        assert_eq!(systems, 1);
+
+        agent.messages_mut().push(Message::User("injected".into()));
+        // system, user, assistant, user, assistant, injected
+        assert_eq!(agent.messages().len(), 6);
+
+        agent.clear();
+        assert!(agent.messages().is_empty());
     }
 }

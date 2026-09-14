@@ -1,100 +1,159 @@
-//! The OpenAI-compatible protocol: request shaping, streaming, error handling.
+//! The OpenAI-compatible protocol: configuration, request shaping, SSE
+//! streaming, error handling.
 //!
-//! Everything above this module speaks [`Message`] / [`Response`]. Any service
-//! that speaks OpenAI Chat Completions works — OpenAI, DeepSeek, OpenRouter,
-//! Qwen, GLM, Moonshot, Groq, Together, Fireworks, vLLM, Ollama, LM Studio,
-//! proxies — by pointing [`Llm::base_url`] at it. No vendor is special-cased.
+//! Any service that speaks OpenAI Chat Completions works — OpenAI, DeepSeek,
+//! OpenRouter, Qwen, GLM, Moonshot, Groq, Together, Fireworks, vLLM, Ollama,
+//! LM Studio, proxies — by pointing [`OpenAiConfig::base_url`] at it. No vendor
+//! is special-cased, and provider-specific fields go through
+//! [`OpenAiConfig::param`] instead of being enumerated here.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
-use crate::tools::{ToolDefinition, clip};
-
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
-const ERROR_BODY_LIMIT: usize = 2000;
+use crate::{Event, Message, Model, Response, ToolCall, ToolDefinition, clip};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_MODEL: &str = "gpt-4o-mini";
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Conventional environment variable holding the key.
 pub const API_KEY_ENV: &str = "OPENAI_API_KEY";
 
-/// One entry of the conversation, in the shape the protocol needs.
+const ERROR_BODY_LIMIT: usize = 2000;
+
+/// Everything the wire protocol needs. Build it with the chainable setters:
 ///
-/// Text and tool calls share one assistant turn, and parallel tool results share
-/// one turn, so each variant maps to one or more messages without regrouping.
+/// ```no_run
+/// # use agent::OpenAiConfig;
+/// let config = OpenAiConfig::default()
+///     .model("deepseek-chat")
+///     .base_url("https://api.deepseek.com")
+///     .api_key("sk-…")
+///     .header("x-tenant", "acme")
+///     .param("reasoning_effort", "high")
+///     .param("temperature", 0.2);
+/// ```
 #[derive(Debug, Clone)]
-pub enum Message {
-    System(String),
-    User(String),
-    Assistant { text: String, calls: Vec<ToolCall> },
-    Tools(Vec<ToolResult>),
-}
-
-#[derive(Debug, Clone)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: Value,
-}
-
-#[derive(Debug, Clone)]
-pub struct ToolResult {
-    pub id: String,
-    pub name: String,
-    pub output: String,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Response {
-    pub text: Option<String>,
-    pub tool_calls: Vec<ToolCall>,
-}
-
-/// A piece of model output that arrives while a turn is still being generated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Delta {
-    /// Answer text.
-    Text,
-    /// Internal reasoning of a reasoning model: worth showing, not part of the answer.
-    Thinking,
-}
-
-pub struct Llm {
+pub struct OpenAiConfig {
     pub model: String,
     pub base_url: String,
-    pub api_key: String,
+    /// `None` for endpoints that need no key, such as a local Ollama or vLLM.
+    pub api_key: Option<String>,
+    pub timeout: Duration,
+    /// Extra request headers, applied last.
+    pub headers: Vec<(String, String)>,
+    /// Provider-specific request fields, merged into the body as given. This is
+    /// the escape hatch for anything this crate does not name: `temperature`,
+    /// `top_p`, `max_completion_tokens`, `seed`, `tool_choice`, `response_format`,
+    /// `reasoning_effort`, `parallel_tool_calls`, ...
+    pub extra_body: Map<String, Value>,
+}
+
+impl Default for OpenAiConfig {
+    fn default() -> Self {
+        Self {
+            model: DEFAULT_MODEL.to_string(),
+            base_url: DEFAULT_BASE_URL.to_string(),
+            api_key: None,
+            timeout: DEFAULT_TIMEOUT,
+            headers: Vec::new(),
+            extra_body: Map::new(),
+        }
+    }
+}
+
+impl OpenAiConfig {
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
+    pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
+    }
+
+    pub fn api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
+    }
+
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Add or replace one field of the request body.
+    pub fn param(mut self, name: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.extra_body.insert(name.into(), value.into());
+        self
+    }
+}
+
+pub struct OpenAiCompatible {
+    config: OpenAiConfig,
     client: reqwest::Client,
 }
 
-impl Llm {
-    /// `model` and `base_url` fall back to OpenAI's own values.
-    pub fn new(model: Option<String>, base_url: Option<String>, api_key: String) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .context("failed to build the HTTP client")?;
-        Ok(Self {
-            model: model.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-            base_url: base_url
-                .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
-                .trim_end_matches('/')
-                .to_string(),
-            api_key,
-            client,
-        })
+impl OpenAiCompatible {
+    /// Start from [`OpenAiConfig::default`].
+    pub fn builder() -> OpenAiConfig {
+        OpenAiConfig::default()
     }
 
-    /// Send one turn and stream it, calling `on_delta` as output arrives.
-    pub async fn chat(
+    pub fn new(config: OpenAiConfig) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(config.timeout)
+            .build()
+            .context("failed to build the HTTP client")?;
+        let config = OpenAiConfig {
+            base_url: config.base_url.trim_end_matches('/').to_string(),
+            ..config
+        };
+        Ok(Self { config, client })
+    }
+
+    pub fn config(&self) -> &OpenAiConfig {
+        &self.config
+    }
+
+    async fn send(&self, body: &Value) -> Result<reqwest::Response> {
+        let url = format!("{}/chat/completions", self.config.base_url);
+        let mut request = self.client.post(&url).json(body);
+        if let Some(key) = &self.config.api_key {
+            request = request.bearer_auth(key);
+        }
+        for (name, value) in &self.config.headers {
+            request = request.header(name, value);
+        }
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("request to {url} failed"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            bail!("api error {status}: {}", clip(&text, ERROR_BODY_LIMIT));
+        }
+        Ok(response)
+    }
+}
+
+impl Model for OpenAiCompatible {
+    async fn chat(
         &self,
         messages: &[Message],
         tools: &[ToolDefinition],
-        on_delta: &mut dyn FnMut(Delta, &str),
+        on_event: &mut dyn FnMut(Event<'_>),
     ) -> Result<Response> {
-        let mut response = self.send(&body(&self.model, messages, tools)).await?;
+        let mut response = self.send(&body(&self.config, messages, tools)).await?;
 
         if !is_event_stream(&response) {
             bail!(
@@ -109,30 +168,10 @@ impl Llm {
         }
 
         let mut stream = Stream::default();
-        read_sse(&mut response, |payload| stream.apply(payload, on_delta)).await?;
+        read_sse(&mut response, |payload| stream.apply(payload, on_event)).await?;
         let response = stream.finish();
         if response.text.is_none() && response.tool_calls.is_empty() {
             bail!("the model returned neither text nor tool calls");
-        }
-        Ok(response)
-    }
-
-    /// One POST per turn; API errors carry their response body, which is where
-    /// these services explain what went wrong.
-    async fn send(&self, body: &Value) -> Result<reqwest::Response> {
-        let url = format!("{}/chat/completions", self.base_url);
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("request to {url} failed"))?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            bail!("api error {status}: {}", clip(&text, ERROR_BODY_LIMIT));
         }
         Ok(response)
     }
@@ -174,7 +213,7 @@ async fn read_sse(
 
 // ------------------------------------------------------------------- request
 
-fn body(model: &str, messages: &[Message], tools: &[ToolDefinition]) -> Value {
+fn body(config: &OpenAiConfig, messages: &[Message], tools: &[ToolDefinition]) -> Value {
     let mut msgs = Vec::with_capacity(messages.len());
     for message in messages {
         match message {
@@ -221,7 +260,11 @@ fn body(model: &str, messages: &[Message], tools: &[ToolDefinition]) -> Value {
         }
     }
 
-    let mut body = json!({"model": model, "messages": msgs, "stream": true});
+    let mut body = json!({
+        "model": config.model,
+        "messages": msgs,
+        "stream": true,
+    });
     if !tools.is_empty() {
         body["tools"] = Value::Array(
             tools
@@ -238,6 +281,12 @@ fn body(model: &str, messages: &[Message], tools: &[ToolDefinition]) -> Value {
                 })
                 .collect(),
         );
+    }
+    // Provider-specific fields come last, so a host can override anything above.
+    if let Some(object) = body.as_object_mut() {
+        for (name, value) in &config.extra_body {
+            object.insert(name.clone(), value.clone());
+        }
     }
     body
 }
@@ -300,7 +349,12 @@ impl CallBuilder {
             arguments: if self.arguments.trim().is_empty() {
                 json!({})
             } else {
-                serde_json::from_str(&self.arguments).unwrap_or_else(|_| json!({}))
+                // Unparseable arguments are kept verbatim, as a JSON string, so
+                // the tool reports what the model actually sent.
+                match serde_json::from_str(&self.arguments) {
+                    Ok(arguments) => arguments,
+                    Err(_) => Value::String(self.arguments),
+                }
             },
         }
     }
@@ -314,15 +368,15 @@ struct Stream {
 }
 
 impl Stream {
-    fn apply(&mut self, payload: &str, on_delta: &mut dyn FnMut(Delta, &str)) -> Result<()> {
+    fn apply(&mut self, payload: &str, on_event: &mut dyn FnMut(Event<'_>)) -> Result<()> {
         let chunk: Chunk = serde_json::from_str(payload).context("unexpected stream event")?;
         for choice in chunk.choices {
             if let Some(text) = choice.delta.content.filter(|text| !text.is_empty()) {
                 self.text.push_str(&text);
-                on_delta(Delta::Text, &text);
+                on_event(Event::Text(&text));
             }
             if let Some(thinking) = choice.delta.reasoning.filter(|text| !text.is_empty()) {
-                on_delta(Delta::Thinking, &thinking);
+                on_event(Event::Thinking(&thinking));
             }
             for call in choice.delta.tool_calls.unwrap_or_default() {
                 while self.calls.len() <= call.index {
@@ -356,30 +410,29 @@ impl Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
-    /// Records the deltas a stream emits, in order.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Records the events a stream emits, in order.
     #[derive(Default)]
-    struct Sink(Vec<(Delta, String)>);
+    struct Sink(Vec<String>);
 
     impl Sink {
-        fn callback(&mut self) -> impl FnMut(Delta, &str) + '_ {
-            |delta, chunk| self.0.push((delta, chunk.to_string()))
+        fn callback(&mut self) -> impl FnMut(Event<'_>) + '_ {
+            |event| {
+                self.0.push(match event {
+                    Event::Text(text) => format!("text:{text}"),
+                    Event::Thinking(text) => format!("thinking:{text}"),
+                    other => format!("other:{other:?}"),
+                })
+            }
         }
+    }
 
-        fn text(&self) -> String {
-            self.0
-                .iter()
-                .filter(|(delta, _)| *delta == Delta::Text)
-                .map(|(_, chunk)| chunk.as_str())
-                .collect()
-        }
-
-        fn thinking(&self) -> usize {
-            self.0
-                .iter()
-                .filter(|(delta, _)| *delta == Delta::Thinking)
-                .count()
-        }
+    fn config() -> OpenAiConfig {
+        OpenAiConfig::default().model("test-model")
     }
 
     #[test]
@@ -400,8 +453,7 @@ mod tests {
         let response = stream.finish();
 
         assert_eq!(response.text.as_deref(), Some("Hello"));
-        assert_eq!(sink.text(), "Hello");
-        assert_eq!(sink.thinking(), 1);
+        assert_eq!(sink.0, ["thinking:hmm", "text:Hel", "text:lo"]);
         assert!(response.tool_calls.is_empty());
     }
 
@@ -430,23 +482,24 @@ mod tests {
     }
 
     #[test]
-    fn keeps_unparseable_arguments_empty() {
+    fn keeps_unparseable_arguments_verbatim() {
         let mut stream = Stream::default();
         let mut sink = Sink::default();
         let mut callback = sink.callback();
         stream
             .apply(
-                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"read","arguments":"not json"}}]}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"read","arguments":"{\"path\":"}}]}}]}"#,
                 &mut callback,
             )
             .unwrap();
         drop(callback);
 
-        assert_eq!(stream.finish().tool_calls[0].arguments, json!({}));
+        let arguments = &stream.finish().tool_calls[0].arguments;
+        assert_eq!(arguments.as_str(), Some("{\"path\":"));
     }
 
     #[test]
-    fn builds_a_request_with_tools_and_history() {
+    fn builds_a_request_with_history_tools_and_params() {
         let messages = vec![
             Message::System("sys".into()),
             Message::User("hi".into()),
@@ -458,20 +511,22 @@ mod tests {
                     arguments: json!({"path": "a.rs"}),
                 }],
             },
-            Message::Tools(vec![ToolResult {
+            Message::Tools(vec![crate::ToolResult {
                 id: "call_1".into(),
                 name: "read".into(),
                 output: "fn main() {}".into(),
             }]),
         ];
         let tools = vec![ToolDefinition {
-            name: "read",
-            description: "read a file",
+            name: "read".into(),
+            description: "read a file".into(),
             parameters: json!({"type": "object"}),
         }];
-        let body = body("test-model", &messages, &tools);
+        let config = config()
+            .param("temperature", 0.2)
+            .param("model", "override");
+        let body = body(&config, &messages, &tools);
 
-        assert_eq!(body["model"], "test-model");
         assert_eq!(body["stream"], true);
         assert_eq!(body["messages"][0]["role"], "system");
         // An assistant turn with calls has null content and carries the calls.
@@ -483,5 +538,166 @@ mod tests {
         assert_eq!(body["messages"][3]["role"], "tool");
         assert_eq!(body["messages"][3]["tool_call_id"], "call_1");
         assert_eq!(body["tools"][0]["function"]["name"], "read");
+        assert_eq!(body["temperature"], 0.2);
+        // Passthrough wins over the typed field, so nothing is off limits.
+        assert_eq!(body["model"], "override");
+    }
+
+    // ------------------------------------------------------------- over HTTP
+
+    /// A throwaway OpenAI-compatible server: `handler` sees the raw request and
+    /// returns the raw response, so a test can encode its expectations in the
+    /// reply and let a failed expectation surface as a request error.
+    async fn serve(handler: impl Fn(&str) -> String + Send + 'static) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let request = read_request(&mut socket).await;
+                let _ = socket.write_all(handler(&request).as_bytes()).await;
+                let _ = socket.shutdown().await;
+                let mut sink = [0u8; 1024];
+                let _ = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut sink)).await;
+            }
+        });
+        format!("http://{address}")
+    }
+
+    async fn read_request(socket: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while let Ok(read) = socket.read(&mut chunk).await {
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            let Some(head_end) = find(&request, b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if request.len() >= head_end + 4 + length {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&request).to_string()
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    fn http(status: &str, content_type: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn sse(events: &[&str]) -> String {
+        http(
+            "200 OK",
+            "text/event-stream",
+            &events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>(),
+        )
+    }
+
+    #[tokio::test]
+    async fn sends_params_and_headers_and_reads_the_stream() {
+        let base_url = serve(|request| {
+            let head = request.to_lowercase();
+            let checks = [
+                (
+                    head.contains("authorization: bearer sekret"),
+                    "no auth header",
+                ),
+                (head.contains("x-tenant: acme"), "no custom header"),
+                (
+                    request.contains("\"temperature\":0.2"),
+                    "no temperature param",
+                ),
+                (
+                    request.contains("\"max_tokens\":128"),
+                    "no max_tokens param",
+                ),
+                (request.contains("\"stream\":true"), "stream not requested"),
+            ];
+            match checks.iter().find(|(ok, _)| !ok) {
+                Some((_, why)) => http("400 Bad Request", "application/json", why),
+                None => sse(&[r#"{"choices":[{"delta":{"content":"done"}}]}"#]),
+            }
+        })
+        .await;
+
+        let model = OpenAiCompatible::new(
+            config()
+                .base_url(base_url)
+                .api_key("sekret")
+                .header("x-tenant", "acme")
+                .param("temperature", 0.2)
+                .param("max_tokens", 128),
+        )
+        .unwrap();
+
+        let mut text = String::new();
+        let response = model
+            .chat(&[Message::User("hi".into())], &[], &mut |event| {
+                if let Event::Text(chunk) = event {
+                    text.push_str(chunk);
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.text.as_deref(), Some("done"));
+        assert_eq!(text, "done");
+    }
+
+    #[tokio::test]
+    async fn works_without_an_api_key() {
+        let base_url = serve(|request| {
+            if request.to_lowercase().contains("authorization") {
+                return http("400 Bad Request", "application/json", "unexpected auth");
+            }
+            sse(&[r#"{"choices":[{"delta":{"content":"ok"}}]}"#])
+        })
+        .await;
+
+        let model = OpenAiCompatible::new(config().base_url(base_url)).unwrap();
+        let response = model
+            .chat(&[Message::User("hi".into())], &[], &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(response.text.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn surfaces_the_error_body() {
+        let base_url = serve(|_| {
+            http(
+                "401 Unauthorized",
+                "application/json",
+                r#"{"error":{"message":"bad key"}}"#,
+            )
+        })
+        .await;
+
+        let model = OpenAiCompatible::new(config().base_url(base_url)).unwrap();
+        let error = model
+            .chat(&[Message::User("hi".into())], &[], &mut |_| {})
+            .await
+            .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("401"), "{message}");
+        assert!(message.contains("bad key"), "{message}");
     }
 }
