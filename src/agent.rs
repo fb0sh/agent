@@ -37,9 +37,10 @@ pub struct Agent {
 pub enum Output {
     /// Nothing at all: render the deltas yourself.
     Quiet,
-    /// A single line while a turn is in flight.
+    /// One line: dots while a turn is in flight, then the model's reasoning
+    /// overwriting itself in place, dimmed.
     Progress,
-    /// The above, plus every tool call, its output and the model's reasoning.
+    /// The above, plus every tool call and its output.
     Verbose,
 }
 
@@ -85,8 +86,10 @@ impl Agent {
                 .chat(&self.messages, &self.definitions, &mut |delta, chunk| {
                     match delta {
                         // Reasoning replaces the previous line in place, so a
-                        // long chain of thought never scrolls the screen.
-                        Delta::Thinking if verbose => {
+                        // long chain of thought never scrolls the screen. It is
+                        // shown by default: on many gateways it is the only
+                        // output that actually arrives progressively.
+                        Delta::Thinking if reporting => {
                             thinking.push_str(chunk);
                             draw(&mut line, &format!("\x1b[2m{}\x1b[0m", tail(&thinking)));
                         }

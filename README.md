@@ -97,11 +97,12 @@ main.rs    CLI, config precedence, rendering
   the callback given to `Agent::run`; progress output is opt-in via `Output`
   (`Quiet` / `Progress` / `Verbose`), and the CLI picks it.
 * Progress uses one line and no scrolling: `......` while a turn is in flight,
-  then, with `--verbose`, the model's reasoning rewritten in place (dimmed,
-  clipped to one line wide), then the answer streaming normally to `stdout`.
-  Nothing else reaches stderr, so `mini-agent "..." > answer.md` captures
-  exactly the answer.
+  then the model's reasoning rewritten in place (dimmed, clipped to one line
+  wide), then the answer. Nothing else reaches stderr, so
+  `mini-agent "..." > answer.md` captures exactly the answer.
 * `--verbose` also prints each tool call with up to three lines of its output.
+  Note that some gateways stream only the reasoning and deliver the answer text
+  in one burst at the end — the reasoning line is the live part there.
 * No provider registry, no tool trait, no service layer: `chat` is one path,
   tools are `match` arms in `Tools::execute`.
 * Tool calls run one at a time on purpose — `write`/`edit`/`exec` depend on each

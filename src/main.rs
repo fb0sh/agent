@@ -51,7 +51,7 @@ struct Args {
     )]
     max_iterations: usize,
 
-    /// Show each tool call, the tool output and the model's reasoning.
+    /// Show each tool call and its output.
     #[arg(short, long, env = "MINI_AGENT_VERBOSE")]
     verbose: bool,
 }
