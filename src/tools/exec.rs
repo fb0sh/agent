@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use super::{CodingTools, arg_str};
-use crate::ToolDefinition;
+use crate::{ToolDefinition, truncate};
 
 pub fn definition(timeout: Duration) -> ToolDefinition {
     ToolDefinition {
@@ -87,6 +87,8 @@ async fn run_with(tools: &CodingTools, args: &Value, timeout: Duration) -> Resul
         None => "killed by signal".to_string(),
     };
     let mut output = format!("exit code: {code}");
+    // `limit` bounds the whole result, not each stream, so the two are cut to fit
+    // together. Markers are added after the cuts, so they survive them.
     for (name, bytes, cut) in [
         ("stdout", &stdout, stdout_cut),
         ("stderr", &stderr, stderr_cut),
@@ -94,9 +96,16 @@ async fn run_with(tools: &CodingTools, args: &Value, timeout: Duration) -> Resul
         if bytes.is_empty() {
             continue;
         }
+        let text = String::from_utf8_lossy(bytes);
+        let room = limit.saturating_sub(output.len() + name.len() + 3);
+        if room == 0 {
+            output.push_str(&format!("\n[{name} truncated]"));
+            continue;
+        }
         output.push_str(&format!("\n{name}:\n"));
-        output.push_str(&String::from_utf8_lossy(bytes));
-        if cut {
+        let kept = truncate(&text, room);
+        output.push_str(kept);
+        if cut || kept.len() < text.len() {
             output.push_str(&format!("\n[{name} truncated]"));
         }
     }
@@ -170,6 +179,24 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("timed out"), "{error}");
+    }
+
+    /// stdout and stderr share one budget, so the total stays near `max_output`
+    /// even when both flood the pipe.
+    #[tokio::test]
+    async fn bounds_the_whole_result_across_both_streams() {
+        let tools = CodingTools::new(temp_dir("exec-budget"))
+            .max_output(2048)
+            .exec_timeout(Duration::from_secs(10));
+
+        let output = run(&tools, &json!({"command": "seq 1 4000; seq 1 4000 >&2"}))
+            .await
+            .unwrap();
+
+        assert!(output.contains("exit code: 0"), "{output}");
+        assert!(output.contains("[stdout truncated]"), "{output}");
+        assert!(output.contains("[stderr truncated]"), "{output}");
+        assert!(output.len() < 4096, "not bounded: {} bytes", output.len());
     }
 
     /// A command that floods its pipe must be drained, not blocked: it should

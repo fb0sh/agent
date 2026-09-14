@@ -15,6 +15,10 @@ use serde_json::{Map, Value, json};
 
 use crate::{Event, Message, Model, Response, ToolCall, ToolDefinition, clip};
 
+/// Body fields the protocol owns. `.param()` may not override these, or the
+/// crate's own assumptions about the request would quietly stop holding.
+const RESERVED: [&str; 4] = ["model", "messages", "tools", "stream"];
+
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_MODEL: &str = "gpt-4o-mini";
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -109,6 +113,11 @@ impl OpenAiCompatible {
     }
 
     pub fn new(config: OpenAiConfig) -> Result<Self> {
+        for reserved in RESERVED {
+            if config.extra_body.contains_key(reserved) {
+                bail!("`{reserved}` belongs to the protocol and cannot be set with .param()");
+            }
+        }
         let client = reqwest::Client::builder()
             .timeout(config.timeout)
             .build()
@@ -219,7 +228,11 @@ fn body(config: &OpenAiConfig, messages: &[Message], tools: &[ToolDefinition]) -
         match message {
             Message::System(text) => msgs.push(json!({"role": "system", "content": text})),
             Message::User(text) => msgs.push(json!({"role": "user", "content": text})),
-            Message::Assistant { text, calls } => {
+            Message::Assistant {
+                text,
+                calls,
+                metadata,
+            } => {
                 let mut msg = json!({"role": "assistant"});
                 // An assistant turn with tool calls must carry them in the same
                 // message, so `content` is explicitly null when there is no text.
@@ -244,6 +257,12 @@ fn body(config: &OpenAiConfig, messages: &[Message], tools: &[ToolDefinition]) -
                             })
                             .collect(),
                     );
+                }
+                if let Some(object) = msg.as_object_mut() {
+                    // Echo back the provider fields captured from its own reply.
+                    for (name, value) in metadata {
+                        object.insert(name.clone(), value.clone());
+                    }
                 }
                 msgs.push(msg);
             }
@@ -311,6 +330,11 @@ struct ChunkDelta {
     /// Reasoning models stream their thinking next to the answer.
     #[serde(default)]
     reasoning: Option<String>,
+    /// Fields a provider expects echoed back on the next request.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning_details: Option<Value>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
@@ -365,6 +389,9 @@ impl CallBuilder {
 struct Stream {
     text: String,
     calls: Vec<CallBuilder>,
+    /// Round-trip fields, collected from the stream and handed back to the agent.
+    reasoning_content: String,
+    reasoning_details: Option<Value>,
 }
 
 impl Stream {
@@ -377,6 +404,12 @@ impl Stream {
             }
             if let Some(thinking) = choice.delta.reasoning.filter(|text| !text.is_empty()) {
                 on_event(Event::Thinking(&thinking));
+            }
+            if let Some(content) = choice.delta.reasoning_content {
+                self.reasoning_content.push_str(&content);
+            }
+            if let Some(details) = choice.delta.reasoning_details {
+                self.reasoning_details = Some(details);
             }
             for call in choice.delta.tool_calls.unwrap_or_default() {
                 while self.calls.len() <= call.index {
@@ -400,9 +433,17 @@ impl Stream {
     }
 
     fn finish(self) -> Response {
+        let mut metadata = Map::new();
+        if !self.reasoning_content.is_empty() {
+            metadata.insert("reasoning_content".into(), json!(self.reasoning_content));
+        }
+        if let Some(details) = self.reasoning_details {
+            metadata.insert("reasoning_details".into(), details);
+        }
         Response {
             text: (!self.text.is_empty()).then_some(self.text),
             tool_calls: self.calls.into_iter().map(CallBuilder::finish).collect(),
+            metadata,
         }
     }
 }
@@ -510,6 +551,7 @@ mod tests {
                     name: "read".into(),
                     arguments: json!({"path": "a.rs"}),
                 }],
+                metadata: Map::new(),
             },
             Message::Tools(vec![crate::ToolResult {
                 id: "call_1".into(),
@@ -524,7 +566,7 @@ mod tests {
         }];
         let config = config()
             .param("temperature", 0.2)
-            .param("model", "override");
+            .param("reasoning_effort", "high");
         let body = body(&config, &messages, &tools);
 
         assert_eq!(body["stream"], true);
@@ -539,8 +581,61 @@ mod tests {
         assert_eq!(body["messages"][3]["tool_call_id"], "call_1");
         assert_eq!(body["tools"][0]["function"]["name"], "read");
         assert_eq!(body["temperature"], 0.2);
-        // Passthrough wins over the typed field, so nothing is off limits.
-        assert_eq!(body["model"], "override");
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["model"], "test-model");
+    }
+
+    #[test]
+    fn rejects_params_the_protocol_owns() {
+        for reserved in RESERVED {
+            let error = match OpenAiCompatible::new(config().param(reserved, "x")) {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("{reserved} should be rejected"),
+            };
+            assert!(error.contains(reserved), "{error}");
+        }
+        // Everything else still goes through.
+        assert!(OpenAiCompatible::new(config().param("seed", 7)).is_ok());
+    }
+
+    #[test]
+    fn round_trips_reasoning_metadata() {
+        let mut stream = Stream::default();
+        let mut sink = Sink::default();
+        let mut callback = sink.callback();
+        for payload in [
+            r#"{"choices":[{"delta":{"reasoning_content":"We "}}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_content":"think."}}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"We think."}]}}]}"#,
+            r#"{"choices":[{"delta":{"content":"done"}}]}"#,
+        ] {
+            stream.apply(payload, &mut callback).unwrap();
+        }
+        drop(callback);
+        let response = stream.finish();
+
+        assert_eq!(
+            response.metadata.get("reasoning_content"),
+            Some(&json!("We think."))
+        );
+        let details = response.metadata.get("reasoning_details").unwrap();
+        assert_eq!(details[0]["type"], "reasoning.text");
+
+        // ... and the same map comes back on the next request.
+        let mut messages = vec![Message::User("hi".into())];
+        messages.push(Message::Assistant {
+            text: response.text.clone().unwrap_or_default(),
+            calls: response.tool_calls.clone(),
+            metadata: response.metadata.clone(),
+        });
+        let body = body(&config(), &messages, &[]);
+        assert_eq!(body["messages"][1]["reasoning_content"], "We think.");
+        assert_eq!(
+            body["messages"][1]["reasoning_details"][0]["type"],
+            "reasoning.text"
+        );
+        // Fields that do not need round-tripping are not echoed.
+        assert!(body["messages"][1].get("content").is_some());
     }
 
     // ------------------------------------------------------------- over HTTP

@@ -143,6 +143,10 @@ async fn run() -> Result<()> {
                 release(&mut line);
                 eprintln!("→ {}({})", name, preview(&arguments.to_string()));
             }
+            Event::ToolSkipped { name } if verbose => {
+                release(&mut line);
+                eprintln!("→ {name} (cancelled by steering)");
+            }
             Event::ToolResult { output, .. } if verbose => {
                 for text in output.lines().take(TRACE_LINES) {
                     eprintln!("  {}", preview(text));
