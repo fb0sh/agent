@@ -99,8 +99,11 @@ async fn run() -> Result<()> {
     let mut agent = Agent::new(llm, tools, args.max_iterations);
 
     let answer = agent.run(&task).await?;
-    if !answer.trim().is_empty() {
-        println!("{}", answer.trim_end());
+    let answer = answer.trim();
+    if answer.is_empty() {
+        eprintln!("(the model finished without an answer)");
+    } else {
+        println!("{answer}");
     }
     Ok(())
 }

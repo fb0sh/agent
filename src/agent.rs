@@ -1,5 +1,7 @@
 //! The agent loop: call the model, run the tools it asks for, repeat.
 
+use std::io::{self, IsTerminal, Write};
+
 use anyhow::{Result, bail};
 
 use crate::llm::{Llm, Message, Response};
@@ -45,8 +47,11 @@ impl Agent {
         self.messages.push(Message::User(task.to_string()));
 
         for _ in 0..self.max_iterations {
-            let Response { text, tool_calls } =
-                self.llm.chat(&self.messages, &self.definitions).await?;
+            // A model turn can take a while; say so instead of showing a blank screen.
+            status(&format!("waiting for {} …", self.llm.model));
+            let response = self.llm.chat(&self.messages, &self.definitions).await;
+            clear_status();
+            let Response { text, tool_calls } = response?;
 
             // No tool calls means the model is done talking.
             if tool_calls.is_empty() {
@@ -85,6 +90,21 @@ impl Agent {
 
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or("(no output)")
+}
+
+/// A transient line on stderr, shown only on a terminal so pipes stay clean.
+fn status(text: &str) {
+    if io::stderr().is_terminal() {
+        eprint!("\r\x1b[2K{text}");
+        let _ = io::stderr().flush();
+    }
+}
+
+fn clear_status() {
+    if io::stderr().is_terminal() {
+        eprint!("\r\x1b[2K");
+        let _ = io::stderr().flush();
+    }
 }
 
 #[cfg(test)]
