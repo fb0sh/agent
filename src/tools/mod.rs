@@ -102,7 +102,7 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 /// Cut `text` down to `max` bytes on a char boundary, marking the cut.
-pub fn clip(text: &str, max: usize) -> String {
+pub(crate) fn clip(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }

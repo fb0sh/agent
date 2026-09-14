@@ -1,8 +1,10 @@
 # mini-agent
 
 A minimal coding agent in Rust. It runs in a working directory with four tools
-— `read`, `write`, `edit`, `exec` — and speaks three API protocols: any
-OpenAI-compatible Chat Completions endpoint, Anthropic and Gemini.
+— `read`, `write`, `edit`, `exec` — and speaks the OpenAI-compatible Chat
+Completions API, so it works with OpenAI, DeepSeek, OpenRouter, Qwen, GLM,
+Moonshot, Groq, Together, Fireworks, vLLM, Ollama, LM Studio and any other
+compatible endpoint.
 
 ```bash
 mini-agent "修复当前项目的编译错误"
@@ -11,6 +13,8 @@ mini-agent "修复当前项目的编译错误"
 ```
 task → LLM → text or tool calls → run tools → feed results back → repeat → final answer
 ```
+
+The package is both a library (`agent`) and a thin CLI (`mini-agent`) over it.
 
 ## Build
 
@@ -25,20 +29,10 @@ cargo build --release        # binary: target/release/mini-agent
 export OPENAI_API_KEY=sk-...
 mini-agent "add a --verbose flag to the CLI"
 
-# DeepSeek
-mini-agent --api openai --base-url https://api.deepseek.com \
-           --model deepseek-chat "check this project"
-
-# Anthropic
-export ANTHROPIC_API_KEY=sk-ant-...
-mini-agent --api anthropic --model claude-sonnet-4-5 "fix the failing tests"
-
-# Gemini
-export GEMINI_API_KEY=...
-mini-agent --api gemini --model gemini-2.5-flash "explain src/main.rs"
-
-# Local models (llama.cpp, vLLM, Ollama, LM Studio, OpenRouter, Groq, ...)
-mini-agent --api openai --base-url http://localhost:11434/v1 --model qwen2.5-coder "sort the imports"
+# Any compatible endpoint: just point --base-url at it
+mini-agent --base-url https://api.deepseek.com --model deepseek-chat "check this project"
+mini-agent --base-url https://openrouter.ai/api/v1 --model qwen/qwen3-coder "sort the imports"
+mini-agent --base-url http://localhost:11434/v1 --model qwen2.5-coder "explain src/main.rs"
 ```
 
 Any task can be given as several words (`mini-agent fix the build`).
@@ -47,10 +41,9 @@ Any task can be given as several words (`mini-agent fix the build`).
 
 | Flag | Env | Default |
 | --- | --- | --- |
-| `--api <API>` | `MINI_AGENT_API` | `openai` |
-| `--model <MODEL>` | `MINI_AGENT_MODEL` | per API |
-| `--base-url <URL>` | `MINI_AGENT_BASE_URL` | per API |
-| `--api-key <KEY>` | `MINI_AGENT_API_KEY` | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` |
+| `--model <MODEL>` | `MINI_AGENT_MODEL` | `gpt-4o-mini` |
+| `--base-url <URL>` | `MINI_AGENT_BASE_URL` | `https://api.openai.com/v1` |
+| `--api-key <KEY>` | `MINI_AGENT_API_KEY` | `OPENAI_API_KEY` |
 | `-C, --cwd <DIR>` | `MINI_AGENT_CWD` | current directory |
 | `--max-iterations <N>` | `MINI_AGENT_MAX_ITERATIONS` | `32` |
 | `-v, --verbose` | `MINI_AGENT_VERBOSE` | off |
@@ -61,7 +54,22 @@ A `.env` file in the working directory is loaded automatically at startup
 (`cp .env.example .env`). It only fills in variables that are not already set,
 so the precedence above still holds. `.env` is git-ignored; never commit keys.
 
-`--api` accepts `openai` (any compatible endpoint), `anthropic` and `gemini`.
+## Library
+
+```rust
+use agent::{Agent, Llm, Output, Tools};
+
+let llm = Llm::new(Some("deepseek-chat".into()), None, api_key)?;
+let mut agent = Agent::new(llm, Tools::new(cwd), 32, Output::Quiet);
+
+// Text and reasoning arrive as they are generated; the return value is the
+// final answer. `Output::Quiet` means the library itself prints nothing.
+let answer = agent.run("fix the build", &mut |delta, chunk| print!("{chunk}")).await?;
+```
+
+`llm.rs` is the only module that knows the wire format, `agent.rs` is the loop,
+`tools/` is the four tools bound to one working directory. Adding a tool means a
+new `tools/<name>.rs`, its `definition()`, and one arm in `Tools::execute`.
 
 ## Tools
 
@@ -78,29 +86,26 @@ the tool result so it can correct itself.
 ## Architecture
 
 ```
-main.rs    CLI parsing, config precedence, wiring
-└── agent.rs    the loop: chat → tool calls → results → chat …
-    ├── llm.rs      internal Message/Response types + one adapter per protocol
+main.rs    CLI, config precedence, rendering
+└── lib.rs      the library: agent, llm, tools
+    ├── agent.rs    the loop: chat → tool calls → results → chat …
+    ├── llm.rs      OpenAI-compatible protocol: request, SSE stream, parsing
     └── tools/      read, write, edit, exec bound to one cwd
 ```
 
-* `llm.rs` is the only place that knows a protocol's JSON. Everything above it
-  speaks `Message` / `Response`.
+* The library never writes to the terminal. Text and reasoning arrive through
+  the callback given to `Agent::run`; progress output is opt-in via `Output`
+  (`Quiet` / `Progress` / `Verbose`), and the CLI picks it.
 * Responses are streamed: answer text goes to `stdout` as it is generated,
-  reasoning (reasoning models only) to `stderr`, dimmed, and only on a terminal.
-  Piping the output therefore yields just the answer.
-* The default output is quiet: a single `thinking…` line while the agent works,
+  reasoning (reasoning models only) to `stderr`, dimmed and only on a terminal.
+* The CLI is quiet by default: a single `thinking…` line while the agent works,
   then the answer. Nothing else reaches stderr, so
-  `mini-agent "..." > answer.md` captures exactly the answer.
-* `--verbose` adds every tool call, up to three lines of tool output and the
-  model's reasoning, so a long run never scrolls the screen away.
-* There is no provider registry, no tool trait, no service layer: `Api` is an
-  enum, `chat` is a `match`, tools are `match` arms in `Tools::execute`.
+  `mini-agent "..." > answer.md` captures exactly the answer, and `--verbose`
+  adds each tool call, up to three lines of tool output and the model's reasoning.
+* No provider registry, no tool trait, no service layer: `chat` is one path,
+  tools are `match` arms in `Tools::execute`.
 * Tool calls run one at a time on purpose — `write`/`edit`/`exec` depend on each
   other's effects.
-
-Adding a tool: a new `tools/<name>.rs`, its `definition()`, and one arm in
-`Tools::execute`. Adding a protocol: `llm.rs` only.
 
 ## Tests
 
@@ -110,8 +115,8 @@ cargo test
 
 Covers `read` (window, missing file, bad offset), `write` (create, overwrite),
 `edit` (0/1/many matches), `exec` (success, non-zero exit, timeout),
-`Tools`/`clip`/`resolve`, per-protocol stream parsing (text, reasoning, and tool
-arguments split across events), and the agent loop against a throwaway
+`Tools`/`clip`/`resolve`, request building, stream parsing (text, reasoning and
+tool arguments split across events), and the agent loop against a throwaway
 OpenAI-compatible SSE server: text answer, streaming deltas, reasoning kept out
 of the answer, reassembly of split tool arguments, one tool call, several rounds,
 tool errors fed back, and hitting `--max-iterations`.

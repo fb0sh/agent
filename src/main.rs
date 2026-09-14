@@ -1,18 +1,11 @@
-//! `mini-agent "fix the build"` — CLI, config and wiring.
-
-mod agent;
-mod llm;
-mod tools;
+//! `mini-agent "fix the build"` — a thin CLI over the `agent` library.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
+use agent::{Agent, Delta, Llm, Output, Tools, llm};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-
-use crate::agent::Agent;
-use crate::llm::{Api, Delta, Llm};
-use crate::tools::Tools;
 
 /// A minimal coding agent that works in the current directory with four tools:
 /// read, write, edit and exec.
@@ -23,25 +16,26 @@ struct Args {
     #[arg(required = true, value_name = "TASK")]
     task: Vec<String>,
 
-    /// API protocol to speak.
-    #[arg(
-        long,
-        env = "MINI_AGENT_API",
-        default_value = "openai",
-        value_name = "API"
-    )]
-    api: Api,
-
-    /// Model name (default depends on --api).
+    /// Model name.
     #[arg(long, env = "MINI_AGENT_MODEL", value_name = "MODEL")]
     model: Option<String>,
 
-    /// API base URL (default depends on --api).
-    #[arg(long, env = "MINI_AGENT_BASE_URL", value_name = "URL")]
+    /// API base URL of any OpenAI-compatible endpoint.
+    #[arg(
+        long,
+        env = "MINI_AGENT_BASE_URL",
+        value_name = "URL",
+        hide_env_values = true
+    )]
     base_url: Option<String>,
 
-    /// API key (default: OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, ...).
-    #[arg(long, env = "MINI_AGENT_API_KEY", value_name = "KEY")]
+    /// API key (default: OPENAI_API_KEY).
+    #[arg(
+        long,
+        env = "MINI_AGENT_API_KEY",
+        value_name = "KEY",
+        hide_env_values = true
+    )]
     api_key: Option<String>,
 
     /// Directory all tools work in.
@@ -91,17 +85,21 @@ async fn run() -> Result<()> {
     let api_key = args
         .api_key
         .filter(|key| !key.trim().is_empty())
-        .or_else(|| api_key_from_env(args.api))
-        .with_context(|| {
-            format!(
-                "no API key: pass --api-key or set {}",
-                args.api.api_key_envs().join(" or ")
-            )
-        })?;
+        .or_else(|| {
+            std::env::var(llm::API_KEY_ENV)
+                .ok()
+                .filter(|key| !key.trim().is_empty())
+        })
+        .with_context(|| format!("no API key: pass --api-key or set {}", llm::API_KEY_ENV))?;
 
-    let llm = Llm::new(args.api, args.model, args.base_url, api_key)?;
+    let llm = Llm::new(args.model, args.base_url, api_key)?;
     let tools = Tools::new(cwd);
-    let mut agent = Agent::new(llm, tools, args.max_iterations, args.verbose);
+    let output = if args.verbose {
+        Output::Verbose
+    } else {
+        Output::Progress
+    };
+    let mut agent = Agent::new(llm, tools, args.max_iterations, output);
 
     // The answer streams straight to stdout. Reasoning is only worth showing on a
     // terminal, and only when the user asked for detail.
@@ -149,12 +147,4 @@ async fn run() -> Result<()> {
         println!("{}", answer.trim_end());
     }
     Ok(())
-}
-
-fn api_key_from_env(api: Api) -> Option<String> {
-    api.api_key_envs().iter().find_map(|name| {
-        std::env::var(name)
-            .ok()
-            .filter(|key| !key.trim().is_empty())
-    })
 }

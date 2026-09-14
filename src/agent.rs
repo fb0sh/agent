@@ -28,12 +28,23 @@ pub struct Agent {
     definitions: Vec<ToolDefinition>,
     messages: Vec<Message>,
     max_iterations: usize,
-    /// Show full tool calls, their output and the model's reasoning.
-    verbose: bool,
+    output: Output,
+}
+
+/// How much the agent reports while it works. The library prints nothing unless
+/// asked, so `Quiet` is the default choice for embedders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Output {
+    /// Nothing at all: render the deltas yourself.
+    Quiet,
+    /// A single line while a turn is in flight.
+    Progress,
+    /// The above, plus every tool call, its output and the model's reasoning.
+    Verbose,
 }
 
 impl Agent {
-    pub fn new(llm: Llm, tools: Tools, max_iterations: usize, verbose: bool) -> Self {
+    pub fn new(llm: Llm, tools: Tools, max_iterations: usize, output: Output) -> Self {
         let definitions = tools.definitions();
         Self {
             llm,
@@ -41,7 +52,7 @@ impl Agent {
             definitions,
             messages: vec![Message::System(SYSTEM_PROMPT.to_string())],
             max_iterations,
-            verbose,
+            output,
         }
     }
 
@@ -61,19 +72,24 @@ impl Agent {
         let mut line_open = false;
         // Set while the one-line progress indicator is on screen.
         let mut status_shown = false;
+        let reporting = self.output != Output::Quiet;
         // Reasoning is only displayed on a terminal, and only when asked for.
-        let show_thinking = self.verbose && on_terminal();
+        let show_thinking = self.output == Output::Verbose && on_terminal();
 
         for _ in 0..self.max_iterations {
             // One short line while the agent works: enough to see that something
             // is happening, nothing that scrolls the screen away.
-            break_line(&mut line_open);
-            show_status(&mut status_shown, "thinking…");
+            if reporting {
+                break_line(&mut line_open);
+                show_status(&mut status_shown, "thinking…");
+            }
             let response = self
                 .llm
                 .chat(&self.messages, &self.definitions, &mut |delta, chunk| {
                     hide_status(&mut status_shown);
-                    line_open = !chunk.ends_with('\n') && (delta == Delta::Text || show_thinking);
+                    line_open = reporting
+                        && !chunk.ends_with('\n')
+                        && (delta == Delta::Text || show_thinking);
                     on_delta(delta, chunk);
                 })
                 .await;
@@ -92,7 +108,7 @@ impl Agent {
             // The indicator stays up while they run, so a slow command still shows life.
             let mut results = Vec::with_capacity(tool_calls.len());
             for call in &tool_calls {
-                if self.verbose {
+                if self.output == Output::Verbose {
                     break_line(&mut line_open);
                     eprintln!(
                         "→ {}({})",
@@ -101,7 +117,7 @@ impl Agent {
                     );
                 }
                 let result = self.tools.execute(call).await;
-                if self.verbose {
+                if self.output == Output::Verbose {
                     break_line(&mut line_open);
                     // At most a few lines of output, so the screen never scrolls away.
                     for line in result.output.lines().take(TRACE_LINES) {
@@ -169,8 +185,6 @@ mod tests {
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-
-    use crate::llm::Api;
 
     /// Wrap OpenAI stream events as an SSE body.
     fn sse(events: &[String]) -> String {
@@ -247,14 +261,8 @@ mod tests {
 
     async fn agent(replies: Vec<String>, steps: usize, cwd: PathBuf) -> Agent {
         let base_url = serve(replies).await;
-        let llm = Llm::new(
-            Api::OpenAi,
-            Some("test".into()),
-            Some(base_url),
-            "test".into(),
-        )
-        .unwrap();
-        Agent::new(llm, Tools::new(cwd), steps, false)
+        let llm = Llm::new(Some("test".into()), Some(base_url), "test".into()).unwrap();
+        Agent::new(llm, Tools::new(cwd), steps, Output::Quiet)
     }
 
     /// A callback that keeps whatever the agent streams, for assertions.
